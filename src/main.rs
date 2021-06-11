@@ -165,19 +165,26 @@ async fn index(
     Ok(HttpResponse::build(response.status()).body(body))
 }
 
+fn check_access_token(config: &web::Data<Mutex<Config>>, req: &HttpRequest) -> Result<(), Error> {
+    let token = req
+        .headers()
+        .get("X-Access-Token")
+        .ok_or_else(|| HttpResponse::BadRequest().body("missing access token"))?;
+    if token != config.lock().unwrap().access_token.as_bytes() {
+        return Err(HttpResponse::Forbidden().body("wrong access token").into());
+    }
+
+    Ok(())
+}
+
 async fn status(
     config: web::Data<Mutex<Config>>,
     jwt_key: web::Data<Mutex<jsonwebtoken::EncodingKey>>,
     req: HttpRequest,
     status_params: web::Json<StatusParams>,
 ) -> Result<HttpResponse, Error> {
-    let token = req
-        .headers()
-        .get("X-Access-Token")
-        .ok_or_else(|| HttpResponse::BadRequest().body("missing access token"))?;
-    if token != config.lock().unwrap().access_token.as_bytes() {
-        return Ok(HttpResponse::Forbidden().body("wrong access token"));
-    }
+    check_access_token(&config, &req)?;
+
     if !status_params
         .repository
         .chars()

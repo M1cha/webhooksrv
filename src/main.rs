@@ -12,8 +12,6 @@ struct Config {
     webhook_secret: String,
     /// repo with the workflow that gets started on webhook events
     repository: String,
-    /// github access token for `repository`
-    token: String,
     /// SSL key
     key: String,
     /// SSL cert
@@ -61,8 +59,47 @@ struct PushEventRepository {
 struct PushEvent {
     repository: PushEventRepository,
 }
+
+async fn get_token(
+    config: &web::Data<Mutex<Config>>,
+    jwt_key: &web::Data<Mutex<jsonwebtoken::EncodingKey>>,
+) -> Result<String, Error> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let claims = Claims {
+        iat: (now - 60).try_into().unwrap(),
+        exp: (now + (1 * 60)).try_into().unwrap(),
+        iss: config.lock().unwrap().jwt_iss,
+    };
+
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
+        &claims,
+        &jwt_key.lock().unwrap(),
+    )
+    .unwrap();
+
+    let client = actix_web::client::Client::default();
+    let mut response = client
+        .post(format!(
+            "https://api.github.com/app/installations/{}/access_tokens",
+            config.lock().unwrap().app_install_id
+        ))
+        .header("User-Agent", "actix-web")
+        .header("Accept", "application/vnd.github.v3+json")
+        .header("Authorization", format!("Bearer {}", token))
+        .send()
+        .await?;
+    let access_tokens: AccessTokens = response.json().await?;
+
+    Ok(access_tokens.token)
+}
+
 async fn index(
     config: web::Data<Mutex<Config>>,
+    jwt_key: web::Data<Mutex<jsonwebtoken::EncodingKey>>,
     mac: web::Data<Mutex<HmacSha256>>,
     req: HttpRequest,
     bytes: web::Bytes,
@@ -111,6 +148,7 @@ async fn index(
         }
     });
 
+    let token = get_token(&config, &jwt_key).await?;
     let client = actix_web::client::Client::default();
     let mut response = client
         .post(format!(
@@ -119,10 +157,7 @@ async fn index(
         ))
         .header("User-Agent", "actix-web")
         .header("Accept", "application/vnd.github.v3+json")
-        .header(
-            "Authorization",
-            format!("token {}", config.lock().unwrap().token),
-        )
+        .header("Authorization", format!("token {}", token))
         .send_json(&request)
         .await?;
     let body = response.body().await?;
@@ -151,36 +186,7 @@ async fn status(
         return Ok(HttpResponse::BadRequest().body("unsupported characters in repository"));
     }
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let claims = Claims {
-        iat: (now - 60).try_into().unwrap(),
-        exp: (now + (1 * 60)).try_into().unwrap(),
-        iss: config.lock().unwrap().jwt_iss,
-    };
-
-    let token = jsonwebtoken::encode(
-        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
-        &claims,
-        &jwt_key.lock().unwrap(),
-    )
-    .unwrap();
-
-    let client = actix_web::client::Client::default();
-    let mut response = client
-        .post(format!(
-            "https://api.github.com/app/installations/{}/access_tokens",
-            config.lock().unwrap().app_install_id
-        ))
-        .header("User-Agent", "actix-web")
-        .header("Accept", "application/vnd.github.v3+json")
-        .header("Authorization", format!("Bearer {}", token))
-        .send()
-        .await?;
-    let access_tokens: AccessTokens = response.json().await?;
-
+    let token = get_token(&config, &jwt_key).await?;
     let request = serde_json::json!({
         "head_sha": status_params.head_sha,
         "name": "Build",
@@ -196,7 +202,7 @@ async fn status(
         ))
         .header("User-Agent", "actix-web")
         .header("Accept", "application/vnd.github.v3+json")
-        .header("Authorization", format!("token {}", access_tokens.token))
+        .header("Authorization", format!("token {}", token))
         .send_json(&request)
         .await?;
     let body = response.body().await?;

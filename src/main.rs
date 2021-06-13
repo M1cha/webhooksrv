@@ -153,11 +153,29 @@ impl WestProject {
             &self.name
         }
     }
+
+    pub fn remote_name<'a>(&'a self, manifest: &'a WestManifest) -> Option<&'a str> {
+        if let Some(remote) = self.remote.as_deref() {
+            return Some(remote);
+        }
+
+        manifest.defaults.remote.as_deref()
+    }
+
+    pub fn url(&self, manifest: &WestManifest) -> Option<String> {
+        if let Some(url) = self.url.as_ref() {
+            return Some(url.to_string());
+        }
+
+        let remote = manifest.remote_by_name(self.remote_name(manifest)?)?;
+
+        Some(format!("{}/{}", remote.url_base, self.repo_path()))
+    }
 }
 
 impl WestManifest {
-    fn project_by_repo_path(&self, repo_path: &str) -> Option<&WestProject> {
-        self.projects.iter().find(|&p| p.repo_path() == repo_path)
+    pub fn remote_by_name(&self, name: &str) -> Option<&WestRemote> {
+        self.remotes.iter().find(|&r| r.name == name)
     }
 }
 
@@ -281,6 +299,11 @@ fn extract_comment_westyml(body: &str) -> Option<&str> {
     }
 
     Some(BODY_REGEX.captures(body)?.get(1)?.as_str())
+}
+
+fn github_path_from_url(url: &str) -> Option<&str> {
+    url.strip_prefix("https://github.com/")
+        .map_or_else(|| url.strip_prefix("ssh://git@github.com/"), |v| Some(v))
 }
 
 async fn update_manifest_branch_inner(
@@ -441,25 +464,22 @@ async fn update_manifest_branch_inner(
 
     log.extend_from_slice(b"parse main west.yml...\n");
     let westyml: WestFile = serde_yaml::from_str(std::str::from_utf8(&output.stdout)?)?;
-    if westyml.manifest.defaults.remote.as_deref() != Some("github") {
-        return Err(anyhow::anyhow!("default remote is not github"));
-    }
-    westyml
-        .manifest
-        .remotes
-        .iter()
-        .find(|&r| r.name == "github" && r.url_base == "ssh://git@github.com")
-        .ok_or_else(|| anyhow::anyhow!("main west.yml doesn't have correct github remote"))?;
     let westproject = westyml
         .manifest
-        .project_by_repo_path(&event.repository.full_name)
+        .projects
+        .iter()
+        .find(|p| {
+            if let Some(url) = p.url(&westyml.manifest) {
+                if let Some(path) = github_path_from_url(&url) {
+                    if path == event.repository.full_name {
+                        return true;
+                    }
+                }
+            }
+
+            false
+        })
         .ok_or_else(|| anyhow::anyhow!("main west.yml has no matching project"))?;
-    if westproject.url.is_some() {
-        return Err(anyhow::anyhow!("project urls are not supported"));
-    }
-    if westproject.remote.is_some() {
-        return Err(anyhow::anyhow!("project remotes are not supported"));
-    }
 
     log.extend_from_slice(b"generate PR manifest...\n");
     let mut westproject = westproject.clone();

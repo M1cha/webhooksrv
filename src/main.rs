@@ -552,7 +552,9 @@ async fn update_manifest_branch_inner(
         .log(log)
         .status;
 
-    if fetch_result.success() {
+    if force_update {
+        log.extend_from_slice(b"force update.\n");
+    } else if fetch_result.success() {
         log.extend_from_slice(b"check if tmp code changed...\n");
         let diff_result = tokio::process::Command::new("git")
             .current_dir(&tmp_repo)

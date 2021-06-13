@@ -51,6 +51,7 @@ struct ApiPullRequest {
     title: String,
     body: String,
     head: ApiHead,
+    state: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -630,6 +631,12 @@ async fn update_manifest_branch(
     token: &str,
     force_update: bool,
 ) -> Result<(), Error> {
+    if event.pull_request.state != "open" {
+        return Err(HttpResponse::Ok()
+            .body("ignored push event (PR is not open)")
+            .into());
+    }
+
     let mut log = vec![];
     log.extend_from_slice(b"```\n");
     let result = update_manifest_branch_inner(config, event, token, force_update, &mut log).await;

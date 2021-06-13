@@ -3,6 +3,7 @@ use hmac::{Mac, NewMac};
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use std::convert::TryInto;
 use std::sync::Mutex;
+use tokio::io::AsyncWriteExt;
 
 type HmacSha256 = hmac::Hmac<sha2::Sha256>;
 
@@ -20,14 +21,12 @@ struct Config {
     jwt_iss: usize,
     /// Path to PEM with the private RSA key of this GitHub App
     jwt_key: String,
-    /// installation ID of the GitHub org where we set status checks
-    app_install_id: u64,
-    /// the secret that's required to use the status API of this service
-    access_token: String,
     /// repos to include. This gets passed to `startswith`
     repos_include: Vec<String>,
     /// repos to exclude. This has to be a full match and comes after repos_include
     repos_exclude: Vec<String>,
+    /// path where we build the repo contents
+    workdir: std::path::PathBuf,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -43,26 +42,154 @@ struct AccessTokens {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct StatusParams {
-    head_sha: String,
-    repository: String,
-    conclusion: String,
-    details_url: String,
+struct ApiHead {
+    sha: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct PushEventRepository {
+struct ApiPullRequest {
+    title: String,
+    body: String,
+    head: ApiHead,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ApiRepository {
     full_name: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct PushEvent {
-    repository: PushEventRepository,
+struct ApiInstallation {
+    id: u64,
+}
+
+#[derive(Debug, serde::Deserialize)]
+enum PullRequestAction {
+    #[serde(rename = "closed")]
+    Closed,
+    #[serde(rename = "edited")]
+    Edited,
+    #[serde(rename = "opened")]
+    Opened,
+    #[serde(rename = "reopened")]
+    Reopened,
+    #[serde(rename = "synchronize")]
+    Synchronize,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct PullRequestEvent {
+    action: PullRequestAction,
+    number: u64,
+    pull_request: ApiPullRequest,
+    repository: ApiRepository,
+    installation: ApiInstallation,
+}
+
+#[derive(Debug, serde::Deserialize)]
+enum Event {
+    PullRequest(PullRequestEvent),
+}
+
+#[derive(Clone, Default, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct WestProject {
+    name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote: Option<String>,
+    #[serde(rename = "repo-path")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repo_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(rename = "west-commands")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    west_commands: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    import: Option<bool>,
+}
+
+#[derive(Clone, Default, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct WestDefaults {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revision: Option<String>,
+}
+
+#[derive(Clone, Default, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct WestRemote {
+    name: String,
+    #[serde(rename = "url-base")]
+    url_base: String,
+}
+
+#[derive(Clone, Default, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct WestManifest {
+    #[serde(default)]
+    defaults: WestDefaults,
+    remotes: Vec<WestRemote>,
+    projects: Vec<WestProject>,
+}
+
+#[derive(Clone, Default, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct WestFile {
+    manifest: WestManifest,
+}
+
+impl WestProject {
+    pub fn repo_path(&self) -> &str {
+        if let Some(repo_path) = &self.repo_path {
+            repo_path
+        } else {
+            &self.name
+        }
+    }
+}
+
+impl WestManifest {
+    fn project_by_repo_path(&self, repo_path: &str) -> Option<&WestProject> {
+        self.projects.iter().find(|&p| p.repo_path() == repo_path)
+    }
+}
+
+trait ExitStatusCheck {
+    fn check(&self) -> Result<(), anyhow::Error>;
+}
+
+impl ExitStatusCheck for std::process::ExitStatus {
+    fn check(&self) -> Result<(), anyhow::Error> {
+        if !self.success() {
+            return Err(anyhow::anyhow!("process failed: {:?}", self.code()));
+        }
+        Ok(())
+    }
+}
+
+trait OutputLog {
+    fn log(&self, log: &mut Vec<u8>) -> &Self;
+}
+
+impl OutputLog for std::process::Output {
+    fn log(&self, log: &mut Vec<u8>) -> &Self {
+        log.extend_from_slice(&self.stderr);
+
+        self
+    }
 }
 
 async fn get_token(
     config: &web::Data<Mutex<Config>>,
     jwt_key: &web::Data<Mutex<jsonwebtoken::EncodingKey>>,
+    installation_id: u64,
 ) -> Result<String, Error> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -70,7 +197,7 @@ async fn get_token(
         .as_secs();
     let claims = Claims {
         iat: (now - 60).try_into().unwrap(),
-        exp: (now + (1 * 60)).try_into().unwrap(),
+        exp: (now + 60).try_into().unwrap(),
         iss: config.lock().unwrap().jwt_iss,
     };
 
@@ -85,7 +212,7 @@ async fn get_token(
     let mut response = client
         .post(format!(
             "https://api.github.com/app/installations/{}/access_tokens",
-            config.lock().unwrap().app_install_id
+            installation_id
         ))
         .header("User-Agent", "actix-web")
         .header("Accept", "application/vnd.github.v3+json")
@@ -97,6 +224,435 @@ async fn get_token(
     Ok(access_tokens.token)
 }
 
+fn check_signature(
+    mac: &web::Data<Mutex<HmacSha256>>,
+    req: &HttpRequest,
+    bytes: &web::Bytes,
+) -> Result<(), Error> {
+    let sig = req
+        .headers()
+        .get("X-Hub-Signature-256")
+        .ok_or_else(|| HttpResponse::BadRequest().body("missing signature"))?
+        .as_bytes();
+    if !sig.starts_with(b"sha256=") {
+        return Err(HttpResponse::BadRequest()
+            .body("unsupported signature type")
+            .into());
+    }
+    let sig = hex::decode(&sig[7..])
+        .map_err(|_| HttpResponse::BadRequest().body("bad signature length"))?;
+
+    let mut mac = mac.lock().unwrap().clone();
+    mac.update(&bytes);
+    mac.verify(&sig)
+        .map_err(|_| HttpResponse::Forbidden().body("invalid signature"))?;
+
+    Ok(())
+}
+
+fn parse_event(req: &HttpRequest, bytes: &web::Bytes) -> Result<Event, Error> {
+    let event_type = req
+        .headers()
+        .get("X-GitHub-Event")
+        .ok_or_else(|| HttpResponse::BadRequest().body("missing event type"))?
+        .to_str()
+        .map_err(|_| HttpResponse::BadRequest().body("event-type isn't a valid string"))?;
+
+    Ok(match event_type {
+        "pull_request" => serde_json::from_slice::<PullRequestEvent>(bytes).map(Event::PullRequest),
+        _ => return Err(HttpResponse::Ok().body("unsupported event").into()),
+    }
+    .map_err(|_| HttpResponse::Ok().body("can't parse event"))?)
+}
+
+fn build_git_url(token: &str, repository: &str) -> String {
+    format!("https://git:{}@github.com/{}", token, repository)
+}
+
+async fn delete_manifest_branch(config: &web::Data<Mutex<Config>>) -> Result<(), Error> {
+    let _config = config.lock().unwrap();
+
+    Ok(())
+}
+
+fn extract_comment_westyml(body: &str) -> Option<&str> {
+    lazy_static::lazy_static! {
+        static ref BODY_REGEX: regex::Regex = regex::Regex::new(r"(?s)west.yml:[\r\n]+```yaml[\r\n]+(.*)[\r\n]+```").unwrap();
+    }
+
+    Some(BODY_REGEX.captures(body)?.get(1)?.as_str())
+}
+
+async fn update_manifest_branch_inner(
+    config: &web::Data<Mutex<Config>>,
+    event: &PullRequestEvent,
+    token: &str,
+    force_update: bool,
+    log: &mut Vec<u8>,
+) -> Result<(), anyhow::Error> {
+    let config = config.lock().unwrap();
+    let manifest_repo = config.workdir.join("manifest");
+    let tmp_repo = config.workdir.join("tmp");
+
+    log.extend_from_slice(b"extract manifest from PR text...\n");
+    let mut comment_westyml = extract_comment_westyml(&event.pull_request.body)
+        .map(|s| serde_yaml::from_str::<Vec<WestProject>>(s))
+        .unwrap_or_else(|| Ok(vec![]))?;
+
+    log.extend_from_slice(b"create workdir...\n");
+    tokio::fs::create_dir_all(&config.workdir).await?;
+
+    if !manifest_repo.exists() {
+        log.extend_from_slice(b"clone manifest...\n");
+        tokio::process::Command::new("git")
+            .arg("clone")
+            .arg("--bare")
+            .arg("-b")
+            .arg("main")
+            .arg(build_git_url(&token, &config.repository))
+            .arg(&manifest_repo)
+            .stderr(std::process::Stdio::piped())
+            .spawn()?
+            .wait_with_output()
+            .await?
+            .log(log)
+            .status
+            .check()?;
+    } else {
+        log.extend_from_slice(b"set manifest URL...\n");
+        tokio::process::Command::new("git")
+            .current_dir(&manifest_repo)
+            .arg("remote")
+            .arg("set-url")
+            .arg("origin")
+            .arg(build_git_url(&token, &config.repository))
+            .stderr(std::process::Stdio::piped())
+            .spawn()?
+            .wait_with_output()
+            .await?
+            .log(log)
+            .status
+            .check()?;
+
+        log.extend_from_slice(b"update manifest repo...\n");
+        tokio::process::Command::new("git")
+            .current_dir(&manifest_repo)
+            .arg("fetch")
+            .arg("origin")
+            .arg("refs/heads/main")
+            .stderr(std::process::Stdio::piped())
+            .spawn()?
+            .wait_with_output()
+            .await?
+            .log(log)
+            .status
+            .check()?;
+    }
+
+    log.extend_from_slice(b"create tmp repo dir...\n");
+    if tmp_repo.exists() {
+        tokio::fs::remove_dir_all(&tmp_repo).await?;
+    }
+    tokio::fs::create_dir_all(&tmp_repo).await?;
+
+    log.extend_from_slice(b"init tmp repo...\n");
+    tokio::process::Command::new("git")
+        .current_dir(&tmp_repo)
+        .arg("init")
+        .stderr(std::process::Stdio::piped())
+        .spawn()?
+        .wait_with_output()
+        .await?
+        .log(log)
+        .status
+        .check()?;
+
+    log.extend_from_slice(b"set git name...\n");
+    tokio::process::Command::new("git")
+        .current_dir(&tmp_repo)
+        .arg("config")
+        .arg("user.name")
+        .arg("multirepo-actions[bot]")
+        .stderr(std::process::Stdio::piped())
+        .spawn()?
+        .wait_with_output()
+        .await?
+        .log(log)
+        .status
+        .check()?;
+
+    log.extend_from_slice(b"set git email...\n");
+    tokio::process::Command::new("git")
+        .current_dir(&tmp_repo)
+        .arg("config")
+        .arg("user.email")
+        .arg(format!(
+            "{}+multirepo-actions[bot]@users.noreply.github.com",
+            config.jwt_iss
+        ))
+        .stderr(std::process::Stdio::piped())
+        .spawn()?
+        .wait_with_output()
+        .await?
+        .log(log)
+        .status
+        .check()?;
+
+    log.extend_from_slice(b"fetch local manifest repo...\n");
+    tokio::process::Command::new("git")
+        .current_dir(&tmp_repo)
+        .arg("fetch")
+        .arg(&manifest_repo)
+        .arg("refs/heads/main")
+        .stderr(std::process::Stdio::piped())
+        .spawn()?
+        .wait_with_output()
+        .await?
+        .log(log)
+        .status
+        .check()?;
+
+    log.extend_from_slice(b"create .github directory...\n");
+    tokio::process::Command::new("git")
+        .current_dir(&tmp_repo)
+        .arg("checkout")
+        .arg("FETCH_HEAD")
+        .arg(".github/workflows/build.yml")
+        .stderr(std::process::Stdio::piped())
+        .spawn()?
+        .wait_with_output()
+        .await?
+        .log(log)
+        .status
+        .check()?;
+
+    log.extend_from_slice(b"get main west.yml...\n");
+    let output = tokio::process::Command::new("git")
+        .current_dir(&tmp_repo)
+        .arg("show")
+        .arg("FETCH_HEAD:west.yml")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?
+        .wait_with_output()
+        .await?;
+    output.log(log);
+    output.status.check()?;
+
+    log.extend_from_slice(b"parse main west.yml...\n");
+    let westyml: WestFile = serde_yaml::from_str(std::str::from_utf8(&output.stdout)?)?;
+    if westyml.manifest.defaults.remote.as_deref() != Some("github") {
+        return Err(anyhow::anyhow!("default remote is not github"));
+    }
+    westyml
+        .manifest
+        .remotes
+        .iter()
+        .find(|&r| r.name == "github" && r.url_base == "ssh://git@github.com")
+        .ok_or_else(|| anyhow::anyhow!("main west.yml doesn't have correct github remote"))?;
+    let westproject = westyml
+        .manifest
+        .project_by_repo_path(&event.repository.full_name)
+        .ok_or_else(|| anyhow::anyhow!("main west.yml has no matching project"))?;
+    if westproject.url.is_some() {
+        return Err(anyhow::anyhow!("project urls are not supported"));
+    }
+    if westproject.remote.is_some() {
+        return Err(anyhow::anyhow!("project remotes are not supported"));
+    }
+
+    log.extend_from_slice(b"generate PR manifest...\n");
+    let mut westproject = westproject.clone();
+    westproject.revision = Some(format!("refs/pull/{}/merge", event.number));
+
+    let mut newwestfile = WestFile {
+        manifest: WestManifest {
+            defaults: westyml.manifest.defaults.clone(),
+            remotes: westyml.manifest.remotes.clone(),
+            projects: vec![
+                WestProject {
+                    name: "manifest-main".to_string(),
+                    repo_path: Some(config.repository.to_string()),
+                    revision: Some("refs/heads/main".to_string()),
+                    import: Some(true),
+                    ..WestProject::default()
+                },
+                westproject,
+            ],
+        },
+    };
+    newwestfile.manifest.projects.append(&mut comment_westyml);
+
+    let newwestfile_str = serde_yaml::to_string(&newwestfile)?;
+
+    let mut file = tokio::fs::File::create(tmp_repo.join("west.yml")).await?;
+    file.write_all(newwestfile_str.as_bytes()).await?;
+    file.sync_all().await?;
+
+    log.extend_from_slice(b"git-add worktree...\n");
+    tokio::process::Command::new("git")
+        .current_dir(&tmp_repo)
+        .arg("add")
+        .arg(".")
+        .stderr(std::process::Stdio::piped())
+        .spawn()?
+        .wait_with_output()
+        .await?
+        .log(log)
+        .status
+        .check()?;
+
+    log.extend_from_slice(b"commit tmp repo...\n");
+    tokio::process::Command::new("git")
+        .current_dir(&tmp_repo)
+        .arg("commit")
+        .arg("-m")
+        .arg(&event.pull_request.title)
+        .stderr(std::process::Stdio::piped())
+        .spawn()?
+        .wait_with_output()
+        .await?
+        .log(log)
+        .status
+        .check()?;
+
+    let url = build_git_url(&token, &event.repository.full_name);
+    let gitref = format!("refs/heads/manifest/pull/{}", event.number);
+
+    log.extend_from_slice(b"fetch current tmp repo...\n");
+    let fetch_result = tokio::process::Command::new("git")
+        .current_dir(&tmp_repo)
+        .arg("fetch")
+        .arg(&url)
+        .arg(&gitref)
+        .stderr(std::process::Stdio::piped())
+        .spawn()?
+        .wait_with_output()
+        .await?
+        .log(log)
+        .status;
+
+    if fetch_result.success() {
+        log.extend_from_slice(b"check if tmp code changed...\n");
+        let diff_result = tokio::process::Command::new("git")
+            .current_dir(&tmp_repo)
+            .arg("diff")
+            .arg("-s")
+            .arg("--exit-code")
+            .arg("FETCH_HEAD")
+            .stderr(std::process::Stdio::piped())
+            .spawn()?
+            .wait_with_output()
+            .await?
+            .log(log)
+            .status;
+        if diff_result.success() {
+            log.extend_from_slice(b"nothing has changed, don't push.\n");
+            return Ok(());
+        }
+
+        log.extend_from_slice(b"something has changed, let's push.\n");
+    } else {
+        log.extend_from_slice(b"can't fetch. ignore and continue pushing.\n");
+    }
+
+    log.extend_from_slice(b"push tmp repo...\n");
+    tokio::process::Command::new("git")
+        .current_dir(&tmp_repo)
+        .arg("push")
+        .arg("-f")
+        .arg(&url)
+        .arg(format!("HEAD:{}", gitref))
+        .stderr(std::process::Stdio::piped())
+        .spawn()?
+        .wait_with_output()
+        .await?
+        .log(log)
+        .status
+        .check()?;
+
+    Ok(())
+}
+
+async fn update_manifest_branch(
+    config: &web::Data<Mutex<Config>>,
+    event: &PullRequestEvent,
+    token: &str,
+    force_update: bool,
+) -> Result<(), Error> {
+    let mut log = vec![];
+    log.extend_from_slice(b"```\n");
+    let result = update_manifest_branch_inner(config, event, token, force_update, &mut log).await;
+    log.extend_from_slice(b"```\n");
+
+    let request = serde_json::json!({
+        "head_sha": event.pull_request.head.sha,
+        "name": "Generate Manifest Branch",
+        "status": "completed",
+        "conclusion": if result.is_ok() { "success" } else { "failure" },
+        "output": {
+            "title": "Sync Log",
+            "summary": result.map_or_else(|e| format!("Error:\n```\n{:?}\n```\n", e), |_| "Successful".to_string()),
+            "text": String::from_utf8_lossy(&log),
+        }
+    });
+    let client = actix_web::client::Client::default();
+    let mut response = client
+        .post(format!(
+            "https://api.github.com/repos/{}/check-runs",
+            event.repository.full_name
+        ))
+        .header("User-Agent", "actix-web")
+        .header("Accept", "application/vnd.github.v3+json")
+        .header("Authorization", format!("token {}", token))
+        .send_json(&request)
+        .await?;
+    let body = response.body().await?;
+
+    Err(HttpResponse::build(response.status()).body(body).into())
+}
+
+async fn handle_pull_request_event(
+    config: &web::Data<Mutex<Config>>,
+    jwt_key: &web::Data<Mutex<jsonwebtoken::EncodingKey>>,
+    event: &PullRequestEvent,
+) -> Result<(), Error> {
+    let mut found = false;
+    for repo_prefix in &config.lock().unwrap().repos_include {
+        if event.repository.full_name.starts_with(repo_prefix) {
+            found = true;
+        }
+    }
+    if !found {
+        return Err(HttpResponse::Ok()
+            .body("ignored push event (no include)")
+            .into());
+    }
+
+    for repo_name in &config.lock().unwrap().repos_exclude {
+        if &event.repository.full_name == repo_name {
+            return Err(HttpResponse::Ok()
+                .body("ignored push event (exclude)")
+                .into());
+        }
+    }
+
+    let token = get_token(config, jwt_key, event.installation.id).await?;
+
+    match &event.action {
+        PullRequestAction::Closed => delete_manifest_branch(config).await?,
+        PullRequestAction::Edited | PullRequestAction::Opened | PullRequestAction::Reopened => {
+            update_manifest_branch(config, &event, &token, false).await?;
+        }
+        PullRequestAction::Synchronize => {
+            // make sure a new workflow gets started
+            update_manifest_branch(config, &event, &token, true).await?;
+        }
+    };
+
+    Ok(())
+}
+
 async fn index(
     config: web::Data<Mutex<Config>>,
     jwt_key: web::Data<Mutex<jsonwebtoken::EncodingKey>>,
@@ -104,117 +660,14 @@ async fn index(
     req: HttpRequest,
     bytes: web::Bytes,
 ) -> Result<HttpResponse, Error> {
-    let sig = req
-        .headers()
-        .get("X-Hub-Signature-256")
-        .ok_or_else(|| HttpResponse::BadRequest().body("missing signature"))?
-        .as_bytes();
-    if !sig.starts_with(b"sha256=") {
-        return Ok(HttpResponse::BadRequest().body("unsupported signature type"));
-    }
-    let sig = hex::decode(&sig[7..])
-        .map_err(|_| HttpResponse::BadRequest().body("bad signature length"))?;
-    let data = String::from_utf8(bytes.to_vec())
-        .map_err(|_| HttpResponse::BadRequest().body("body is not valid utf-8"))?;
+    check_signature(&mac, &req, &bytes)?;
+    let event = parse_event(&req, &bytes)?;
 
-    let mut mac = mac.lock().unwrap().clone();
-    mac.update(&bytes);
-    mac.verify(&sig)
-        .map_err(|_| HttpResponse::Forbidden().body("invalid signature"))?;
-
-    let push_event = serde_json::from_slice::<PushEvent>(&bytes)
-        .map_err(|_| HttpResponse::Ok().body("unsupported event"))?;
-
-    let mut found = false;
-    for repo_prefix in &config.lock().unwrap().repos_include {
-        if push_event.repository.full_name.starts_with(repo_prefix) {
-            found = true;
-        }
-    }
-    if !found {
-        return Ok(HttpResponse::Ok().body("ignored push event (no include)"));
+    match &event {
+        Event::PullRequest(event) => handle_pull_request_event(&config, &jwt_key, event).await?,
     }
 
-    for repo_name in &config.lock().unwrap().repos_exclude {
-        if &push_event.repository.full_name == repo_name {
-            return Ok(HttpResponse::Ok().body("ignored push event (exclude)"));
-        }
-    }
-
-    let request = serde_json::json!({
-        "ref": "refs/heads/main",
-        "inputs": {
-            "webhook_payload": data
-        }
-    });
-
-    let token = get_token(&config, &jwt_key).await?;
-    let client = actix_web::client::Client::default();
-    let mut response = client
-        .post(format!(
-            "https://api.github.com/repos/{}/actions/workflows/build.yml/dispatches",
-            config.lock().unwrap().repository
-        ))
-        .header("User-Agent", "actix-web")
-        .header("Accept", "application/vnd.github.v3+json")
-        .header("Authorization", format!("token {}", token))
-        .send_json(&request)
-        .await?;
-    let body = response.body().await?;
-
-    Ok(HttpResponse::build(response.status()).body(body))
-}
-
-fn check_access_token(config: &web::Data<Mutex<Config>>, req: &HttpRequest) -> Result<(), Error> {
-    let token = req
-        .headers()
-        .get("X-Access-Token")
-        .ok_or_else(|| HttpResponse::BadRequest().body("missing access token"))?;
-    if token != config.lock().unwrap().access_token.as_bytes() {
-        return Err(HttpResponse::Forbidden().body("wrong access token").into());
-    }
-
-    Ok(())
-}
-
-async fn status(
-    config: web::Data<Mutex<Config>>,
-    jwt_key: web::Data<Mutex<jsonwebtoken::EncodingKey>>,
-    req: HttpRequest,
-    status_params: web::Json<StatusParams>,
-) -> Result<HttpResponse, Error> {
-    check_access_token(&config, &req)?;
-
-    if !status_params
-        .repository
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '/' || c == '-' || c == '_')
-    {
-        return Ok(HttpResponse::BadRequest().body("unsupported characters in repository"));
-    }
-
-    let token = get_token(&config, &jwt_key).await?;
-    let request = serde_json::json!({
-        "head_sha": status_params.head_sha,
-        "name": "Build",
-        "status": "completed",
-        "conclusion": status_params.conclusion,
-        "details_url": status_params.details_url
-    });
-    let client = actix_web::client::Client::default();
-    let mut response = client
-        .post(format!(
-            "https://api.github.com/repos/{}/check-runs",
-            status_params.repository
-        ))
-        .header("User-Agent", "actix-web")
-        .header("Accept", "application/vnd.github.v3+json")
-        .header("Authorization", format!("token {}", token))
-        .send_json(&request)
-        .await?;
-    let body = response.body().await?;
-
-    Ok(HttpResponse::build(response.status()).body(body))
+    Ok(HttpResponse::Ok().finish())
 }
 
 fn json_error_handler(err: error::JsonPayloadError, _req: &HttpRequest) -> error::Error {
@@ -259,7 +712,6 @@ async fn main() -> std::io::Result<()> {
             .app_data(mac.clone())
             .app_data(config.clone())
             .wrap(middleware::Logger::default())
-            .service(web::resource("/status").route(web::post().to(status)))
             .service(web::resource("/").route(web::post().to(index)))
     })
     .bind_openssl("0.0.0.0:443", builder)?

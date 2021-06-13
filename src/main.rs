@@ -287,12 +287,6 @@ fn build_git_url(token: &str, repository: &str) -> String {
     format!("https://git:{}@github.com/{}", token, repository)
 }
 
-async fn delete_manifest_branch(config: &web::Data<Mutex<Config>>) -> Result<(), Error> {
-    let _config = config.lock().unwrap();
-
-    Ok(())
-}
-
 fn extract_comment_westyml(body: &str) -> Option<&str> {
     lazy_static::lazy_static! {
         static ref BODY_REGEX: regex::Regex = regex::Regex::new(r"(?s)west.yml:[\r\n]+```yaml[\r\n]+(.*)[\r\n]+```").unwrap();
@@ -304,6 +298,40 @@ fn extract_comment_westyml(body: &str) -> Option<&str> {
 fn github_path_from_url(url: &str) -> Option<&str> {
     url.strip_prefix("https://github.com/")
         .map_or_else(|| url.strip_prefix("ssh://git@github.com/"), |v| Some(v))
+}
+
+async fn delete_manifest_branch(
+    config: &web::Data<Mutex<Config>>,
+    event: &PullRequestEvent,
+    token: &str,
+) -> Result<(), Error> {
+    let config = config.lock().unwrap();
+    let tmp_repo = config.workdir.join("tmp");
+
+    if tmp_repo.exists() {
+        tokio::fs::remove_dir_all(&tmp_repo).await?;
+    }
+    tokio::fs::create_dir_all(&tmp_repo).await?;
+
+    tokio::process::Command::new("git")
+        .current_dir(&tmp_repo)
+        .arg("init")
+        .spawn()?
+        .await?
+        .check()
+        .map_err(|_| HttpResponse::BadRequest().body("can't init tmp git repo"))?;
+
+    tokio::process::Command::new("git")
+        .current_dir(&tmp_repo)
+        .arg("push")
+        .arg(build_git_url(&token, &event.repository.full_name))
+        .arg(format!(":refs/heads/manifest/pull/{}", event.number))
+        .spawn()?
+        .await?
+        .check()
+        .map_err(|_| HttpResponse::BadRequest().body("can't delete manifest branch"))?;
+
+    Ok(())
 }
 
 async fn update_manifest_branch_inner(
@@ -662,7 +690,7 @@ async fn handle_pull_request_event(
     let token = get_token(config, jwt_key, event.installation.id).await?;
 
     match &event.action {
-        PullRequestAction::Closed => delete_manifest_branch(config).await?,
+        PullRequestAction::Closed => delete_manifest_branch(config, &event, &token).await?,
         PullRequestAction::Edited | PullRequestAction::Opened | PullRequestAction::Reopened => {
             update_manifest_branch(config, &event, &token, false).await?;
         }

@@ -640,6 +640,16 @@ async fn update_manifest_branch(
             .body("ignored event (PR is not open)")
             .into());
     }
+    if event.pull_request.head.repo.full_name != event.repository.full_name {
+        return Err(HttpResponse::Ok()
+            .body("ignored event (heas is not in event repo)")
+            .into());
+    }
+    if event.pull_request.base.repo.full_name != event.repository.full_name {
+        return Err(HttpResponse::Ok()
+            .body("ignored event (base is not in event repo)")
+            .into());
+    }
 
     let mut log = vec![];
     log.extend_from_slice(b"```\n");

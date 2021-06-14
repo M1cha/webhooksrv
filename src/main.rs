@@ -166,6 +166,14 @@ impl WestProject {
         manifest.defaults.remote.as_deref()
     }
 
+    pub fn revision<'a>(&'a self, manifest: &'a WestManifest) -> Option<&'a str> {
+        if let Some(revision) = self.revision.as_deref() {
+            return Some(revision);
+        }
+
+        manifest.defaults.revision.as_deref()
+    }
+
     pub fn url(&self, manifest: &WestManifest) -> Option<String> {
         if let Some(url) = self.url.as_ref() {
             return Some(url.to_string());
@@ -502,9 +510,13 @@ async fn update_manifest_branch_inner(
         .projects
         .iter()
         .find(|p| {
-            if let Some(url) = p.url(&westyml.manifest) {
+            if let (Some(url), Some(revision)) =
+                (p.url(&westyml.manifest), p.revision(&westyml.manifest))
+            {
                 if let Some(path) = github_path_from_url(&url) {
-                    if path == event.repository.full_name {
+                    if path == event.repository.full_name
+                        && revision == event.pull_request.base.r#ref
+                    {
                         return true;
                     }
                 }

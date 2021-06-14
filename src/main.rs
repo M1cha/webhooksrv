@@ -637,7 +637,7 @@ async fn update_manifest_branch(
 ) -> Result<(), Error> {
     if event.pull_request.state != "open" {
         return Err(HttpResponse::Ok()
-            .body("ignored push event (PR is not open)")
+            .body("ignored event (PR is not open)")
             .into());
     }
 

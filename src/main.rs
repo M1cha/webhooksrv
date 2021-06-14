@@ -526,6 +526,17 @@ async fn update_manifest_branch_inner(
         })
         .ok_or_else(|| anyhow::anyhow!("main west.yml has no matching project"))?;
 
+    let mut file = tokio::fs::File::create(tmp_repo.join("PR_INFO")).await?;
+    file.write_all(format!("PR_NUMBER={}\n", event.number).as_bytes())
+        .await?;
+    file.write_all(format!("PR_HEAD_SHA={}\n", event.pull_request.head.sha).as_bytes())
+        .await?;
+    file.write_all(format!("PR_BASE_SHA={}\n", event.pull_request.base.sha).as_bytes())
+        .await?;
+    file.write_all(format!("PR_WEST_PROJECT_NAME={}\n", westproject.name).as_bytes())
+        .await?;
+    file.sync_all().await?;
+
     log.extend_from_slice(b"generate PR manifest...\n");
     let mut westproject = westproject.clone();
     westproject.revision = Some(format!("refs/pull/{}/merge", event.number));

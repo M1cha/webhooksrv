@@ -42,15 +42,18 @@ struct AccessTokens {
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct ApiHead {
+struct ApiBranch {
+    r#ref: String,
     sha: String,
+    repo: ApiRepository,
 }
 
 #[derive(Debug, serde::Deserialize)]
 struct ApiPullRequest {
     title: String,
     body: String,
-    head: ApiHead,
+    head: ApiBranch,
+    base: ApiBranch,
     state: String,
 }
 

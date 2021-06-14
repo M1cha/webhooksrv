@@ -393,8 +393,9 @@ async fn update_manifest_branch_inner(
         tokio::process::Command::new("git")
             .current_dir(&manifest_repo)
             .arg("fetch")
+            .arg("-f")
             .arg("origin")
-            .arg("refs/heads/main")
+            .arg("refs/heads/main:refs/heads/main")
             .stderr(std::process::Stdio::piped())
             .spawn()?
             .wait_with_output()

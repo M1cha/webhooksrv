@@ -299,12 +299,16 @@ fn build_git_url(token: &str, repository: &str) -> String {
     format!("https://git:{}@github.com/{}", token, repository)
 }
 
-fn extract_comment_westyml(body: &str) -> Option<&str> {
+fn extract_comment_westyml(body: &str) -> Option<(&str, &str)> {
     lazy_static::lazy_static! {
-        static ref BODY_REGEX: regex::Regex = regex::Regex::new(r"(?s)west.yml:[\r\n]+```yaml[\r\n]+(.*)[\r\n]+```").unwrap();
+        static ref BODY_REGEX: regex::Regex = regex::Regex::new(r"(?s)west.yml(\(ref:([a-zA-Z0-9/]+)\))?:[\r\n]+```yaml[\r\n]+(.*)[\r\n]+```").unwrap();
     }
 
-    Some(BODY_REGEX.captures(body)?.get(1)?.as_str())
+    let captures = BODY_REGEX.captures(body)?;
+    let gitref = captures.get(2).map(|m| m.as_str()).unwrap_or("");
+    let manifest = captures.get(3)?.as_str();
+
+    Some((gitref, manifest))
 }
 
 fn github_path_from_url(url: &str) -> Option<&str> {
@@ -358,9 +362,10 @@ async fn update_manifest_branch_inner(
     let tmp_repo = config.workdir.join("tmp");
 
     log.extend_from_slice(b"extract manifest from PR text...\n");
-    let mut comment_westyml = extract_comment_westyml(&event.pull_request.body)
-        .map(|s| serde_yaml::from_str::<Vec<WestProject>>(s))
-        .unwrap_or_else(|| Ok(vec![]))?;
+    let (comment_manifestref, mut comment_westyml) =
+        extract_comment_westyml(&event.pull_request.body)
+            .map(|(gitref, s)| serde_yaml::from_str::<Vec<WestProject>>(s).map(|v| (gitref, v)))
+            .unwrap_or_else(|| Ok(("refs/heads/main", vec![])))?;
 
     log.extend_from_slice(b"create workdir...\n");
     tokio::fs::create_dir_all(&config.workdir).await?;
@@ -370,8 +375,6 @@ async fn update_manifest_branch_inner(
         tokio::process::Command::new("git")
             .arg("clone")
             .arg("--bare")
-            .arg("-b")
-            .arg("main")
             .arg(build_git_url(&token, &config.repository))
             .arg(&manifest_repo)
             .stderr(std::process::Stdio::piped())
@@ -396,22 +399,22 @@ async fn update_manifest_branch_inner(
             .log(log)
             .status
             .check()?;
-
-        log.extend_from_slice(b"update manifest repo...\n");
-        tokio::process::Command::new("git")
-            .current_dir(&manifest_repo)
-            .arg("fetch")
-            .arg("-f")
-            .arg("origin")
-            .arg("refs/heads/main:refs/heads/main")
-            .stderr(std::process::Stdio::piped())
-            .spawn()?
-            .wait_with_output()
-            .await?
-            .log(log)
-            .status
-            .check()?;
     }
+
+    log.extend_from_slice(b"update manifest repo...\n");
+    tokio::process::Command::new("git")
+        .current_dir(&manifest_repo)
+        .arg("fetch")
+        .arg("-f")
+        .arg("origin")
+        .arg(format!("{gitref}:{gitref}", gitref = comment_manifestref))
+        .stderr(std::process::Stdio::piped())
+        .spawn()?
+        .wait_with_output()
+        .await?
+        .log(log)
+        .status
+        .check()?;
 
     log.extend_from_slice(b"create tmp repo dir...\n");
     if tmp_repo.exists() {
@@ -467,7 +470,7 @@ async fn update_manifest_branch_inner(
         .current_dir(&tmp_repo)
         .arg("fetch")
         .arg(&manifest_repo)
-        .arg("refs/heads/main")
+        .arg(comment_manifestref)
         .stderr(std::process::Stdio::piped())
         .spawn()?
         .wait_with_output()
@@ -549,7 +552,7 @@ async fn update_manifest_branch_inner(
                 WestProject {
                     name: "manifest-main".to_string(),
                     repo_path: Some(config.repository.to_string()),
-                    revision: Some("refs/heads/main".to_string()),
+                    revision: Some(comment_manifestref.to_string()),
                     import: Some(true),
                     ..WestProject::default()
                 },

@@ -508,18 +508,14 @@ async fn update_manifest_branch_inner(
 
     log.extend_from_slice(b"parse main west.yml...\n");
     let westyml: WestFile = serde_yaml::from_str(std::str::from_utf8(&output.stdout)?)?;
-    let westproject = westyml
+    let westprojects: Vec<_> = westyml
         .manifest
         .projects
         .iter()
-        .find(|p| {
-            if let (Some(url), Some(revision)) =
-                (p.url(&westyml.manifest), p.revision(&westyml.manifest))
-            {
+        .filter(|p| {
+            if let Some(url) = p.url(&westyml.manifest) {
                 if let Some(path) = github_path_from_url(&url) {
-                    if path == event.repository.full_name
-                        && revision == event.pull_request.base.r#ref
-                    {
+                    if path == event.repository.full_name {
                         return true;
                     }
                 }
@@ -527,7 +523,17 @@ async fn update_manifest_branch_inner(
 
             false
         })
-        .ok_or_else(|| anyhow::anyhow!("main west.yml has no matching project"))?;
+        .collect();
+    if westprojects.is_empty() {
+        return Err(anyhow::anyhow!("main west.yml has no matching project"));
+    }
+    if westprojects.len() > 1 {
+        return Err(anyhow::anyhow!(
+            "main west.yml has {} matching projects",
+            westprojects.len()
+        ));
+    }
+    let westproject = westprojects[0];
 
     let mut file = tokio::fs::File::create(tmp_repo.join("PR_INFO")).await?;
     file.write_all(format!("PR_NUMBER={}\n", event.number).as_bytes())

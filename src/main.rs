@@ -551,6 +551,12 @@ async fn update_manifest_branch_inner(
     }
     let westproject = westprojects[0];
 
+    if comment_westyml.iter().any(|p| p.name == westproject.name) {
+        return Err(anyhow::anyhow!(
+            "denied overwriting PR repo using PR comment"
+        ));
+    }
+
     let mut file = tokio::fs::File::create(tmp_repo.join("PR_INFO")).await?;
     file.write_all(format!("PR_NUMBER={}\n", event.number).as_bytes())
         .await?;

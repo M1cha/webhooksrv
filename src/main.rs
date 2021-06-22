@@ -311,6 +311,12 @@ fn extract_comment_westyml(body: &str) -> Option<(&str, &str)> {
     Some((gitref, manifest))
 }
 
+fn extract_comment_westyml_parsed(body: &str) -> Result<(&str, Vec<WestProject>), anyhow::Error> {
+    Ok(extract_comment_westyml(body)
+        .map(|(gitref, s)| serde_yaml::from_str::<Vec<WestProject>>(s).map(|v| (gitref, v)))
+        .unwrap_or_else(|| Ok(("refs/heads/main", vec![])))?)
+}
+
 fn github_path_from_url(url: &str) -> Option<&str> {
     url.strip_prefix("https://github.com/")
         .map_or_else(|| url.strip_prefix("ssh://git@github.com/"), |v| Some(v))
@@ -363,9 +369,7 @@ async fn update_manifest_branch_inner(
 
     log.extend_from_slice(b"extract manifest from PR text...\n");
     let (comment_manifestref, mut comment_westyml) =
-        extract_comment_westyml(&event.pull_request.body)
-            .map(|(gitref, s)| serde_yaml::from_str::<Vec<WestProject>>(s).map(|v| (gitref, v)))
-            .unwrap_or_else(|| Ok(("refs/heads/main", vec![])))?;
+        extract_comment_westyml_parsed(&event.pull_request.body)?;
 
     log.extend_from_slice(b"create workdir...\n");
     tokio::fs::create_dir_all(&config.workdir).await?;

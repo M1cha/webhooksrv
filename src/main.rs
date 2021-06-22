@@ -307,7 +307,10 @@ fn extract_comment_westyml(body: &str) -> Option<(&str, &str)> {
     }
 
     let captures = BODY_REGEX.captures(body)?;
-    let gitref = captures.get(2).map(|m| m.as_str()).unwrap_or("");
+    let gitref = captures
+        .get(2)
+        .map(|m| m.as_str())
+        .unwrap_or(DEFAULT_BRANCH);
     let manifest = captures.get(3)?.as_str();
 
     Some((gitref, manifest))

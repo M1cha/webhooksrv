@@ -97,7 +97,7 @@ enum Event {
     PullRequest(PullRequestEvent),
 }
 
-#[derive(Clone, Default, Debug, serde::Deserialize, serde::Serialize)]
+#[derive(PartialEq, Clone, Default, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct WestProject {
     name: String,
@@ -842,4 +842,54 @@ async fn main() -> std::io::Result<()> {
     .bind_openssl("0.0.0.0:443", builder)?
     .run()
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pr_comment() {
+        // no yml
+        assert_eq!(
+            extract_comment_westyml_parsed("").unwrap(),
+            (DEFAULT_BRANCH, vec![])
+        );
+        // empty yml
+        assert_eq!(
+            extract_comment_westyml_parsed("west.yml:\n```yaml\n\n\n```\n").unwrap(),
+            (DEFAULT_BRANCH, vec![])
+        );
+        // empty yml with ref
+        assert_eq!(
+            extract_comment_westyml_parsed("west.yml(ref:refs/heads/tmp):\n```yaml\n\n\n```\n")
+                .unwrap(),
+            ("refs/heads/tmp", vec![])
+        );
+        // simple yml
+        assert_eq!(
+            extract_comment_westyml_parsed("west.yml:\n```yaml\n- name: lol\n```\n").unwrap(),
+            (
+                DEFAULT_BRANCH,
+                vec![WestProject {
+                    name: "lol".to_string(),
+                    ..WestProject::default()
+                }]
+            )
+        );
+        // simple yml with ref
+        assert_eq!(
+            extract_comment_westyml_parsed(
+                "west.yml(ref:refs/heads/tmp2):\n```yaml\n- name: lol\n```\n"
+            )
+            .unwrap(),
+            (
+                "refs/heads/tmp2",
+                vec![WestProject {
+                    name: "lol".to_string(),
+                    ..WestProject::default()
+                }]
+            )
+        );
+    }
 }

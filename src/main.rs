@@ -318,7 +318,14 @@ fn extract_comment_westyml(body: &str) -> Option<(&str, &str)> {
 
 fn extract_comment_westyml_parsed(body: &str) -> Result<(&str, Vec<WestProject>), anyhow::Error> {
     Ok(extract_comment_westyml(body)
-        .map(|(gitref, s)| serde_yaml::from_str::<Vec<WestProject>>(s).map(|v| (gitref, v)))
+        .map(|(gitref, s)| {
+            // yaml doesn't like empty lists
+            if s.trim() == "" {
+                Ok((gitref, vec![]))
+            } else {
+                serde_yaml::from_str::<Vec<WestProject>>(s).map(|v| (gitref, v))
+            }
+        })
         .unwrap_or_else(|| Ok((DEFAULT_BRANCH, vec![])))?)
 }
 

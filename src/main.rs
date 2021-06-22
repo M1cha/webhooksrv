@@ -7,6 +7,8 @@ use tokio::io::AsyncWriteExt;
 
 type HmacSha256 = hmac::Hmac<sha2::Sha256>;
 
+static DEFAULT_BRANCH: &str = "refs/heads/main";
+
 #[derive(Debug, serde::Deserialize)]
 struct Config {
     /// this can be used to verify the signature of GitHub webhook events
@@ -314,7 +316,7 @@ fn extract_comment_westyml(body: &str) -> Option<(&str, &str)> {
 fn extract_comment_westyml_parsed(body: &str) -> Result<(&str, Vec<WestProject>), anyhow::Error> {
     Ok(extract_comment_westyml(body)
         .map(|(gitref, s)| serde_yaml::from_str::<Vec<WestProject>>(s).map(|v| (gitref, v)))
-        .unwrap_or_else(|| Ok(("refs/heads/main", vec![])))?)
+        .unwrap_or_else(|| Ok((DEFAULT_BRANCH, vec![])))?)
 }
 
 fn github_path_from_url(url: &str) -> Option<&str> {

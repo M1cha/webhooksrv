@@ -5,6 +5,9 @@ use std::convert::TryInto;
 use std::sync::Mutex;
 use tokio::io::AsyncWriteExt;
 
+mod ghapi;
+mod west;
+
 type HmacSha256 = hmac::Hmac<sha2::Sha256>;
 
 static DEFAULT_BRANCH: &str = "refs/heads/main";
@@ -29,168 +32,6 @@ struct Config {
     repos_exclude: Vec<String>,
     /// path where we build the repo contents
     workdir: std::path::PathBuf,
-}
-
-#[derive(Debug, serde::Serialize)]
-struct Claims {
-    iat: usize,
-    exp: usize,
-    iss: usize,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct AccessTokens {
-    token: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ApiBranch {
-    r#ref: String,
-    sha: String,
-    repo: ApiRepository,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ApiPullRequest {
-    title: String,
-    body: String,
-    head: ApiBranch,
-    base: ApiBranch,
-    state: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ApiRepository {
-    full_name: String,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct ApiInstallation {
-    id: u64,
-}
-
-#[derive(Debug, serde::Deserialize)]
-enum PullRequestAction {
-    #[serde(rename = "closed")]
-    Closed,
-    #[serde(rename = "edited")]
-    Edited,
-    #[serde(rename = "opened")]
-    Opened,
-    #[serde(rename = "reopened")]
-    Reopened,
-    #[serde(rename = "synchronize")]
-    Synchronize,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct PullRequestEvent {
-    action: PullRequestAction,
-    number: u64,
-    pull_request: ApiPullRequest,
-    repository: ApiRepository,
-    installation: ApiInstallation,
-}
-
-#[derive(Debug, serde::Deserialize)]
-enum Event {
-    PullRequest(PullRequestEvent),
-}
-
-#[derive(PartialEq, Clone, Default, Debug, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-struct WestProject {
-    name: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    remote: Option<String>,
-    #[serde(rename = "repo-path")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    repo_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    revision: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    path: Option<String>,
-    #[serde(rename = "west-commands")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    west_commands: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    import: Option<bool>,
-}
-
-#[derive(Clone, Default, Debug, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-struct WestDefaults {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    remote: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    revision: Option<String>,
-}
-
-#[derive(Clone, Default, Debug, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-struct WestRemote {
-    name: String,
-    #[serde(rename = "url-base")]
-    url_base: String,
-}
-
-#[derive(Clone, Default, Debug, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-struct WestManifest {
-    #[serde(default)]
-    defaults: WestDefaults,
-    remotes: Vec<WestRemote>,
-    projects: Vec<WestProject>,
-}
-
-#[derive(Clone, Default, Debug, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-struct WestFile {
-    manifest: WestManifest,
-}
-
-impl WestProject {
-    pub fn repo_path(&self) -> &str {
-        if let Some(repo_path) = &self.repo_path {
-            repo_path
-        } else {
-            &self.name
-        }
-    }
-
-    pub fn remote_name<'a>(&'a self, manifest: &'a WestManifest) -> Option<&'a str> {
-        if let Some(remote) = self.remote.as_deref() {
-            return Some(remote);
-        }
-
-        manifest.defaults.remote.as_deref()
-    }
-
-    pub fn revision<'a>(&'a self, manifest: &'a WestManifest) -> Option<&'a str> {
-        if let Some(revision) = self.revision.as_deref() {
-            return Some(revision);
-        }
-
-        manifest.defaults.revision.as_deref()
-    }
-
-    pub fn url(&self, manifest: &WestManifest) -> Option<String> {
-        if let Some(url) = self.url.as_ref() {
-            return Some(url.to_string());
-        }
-
-        let remote = manifest.remote_by_name(self.remote_name(manifest)?)?;
-
-        Some(format!("{}/{}", remote.url_base, self.repo_path()))
-    }
-}
-
-impl WestManifest {
-    pub fn remote_by_name(&self, name: &str) -> Option<&WestRemote> {
-        self.remotes.iter().find(|&r| r.name == name)
-    }
 }
 
 trait ExitStatusCheck {
@@ -227,7 +68,7 @@ async fn get_token(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    let claims = Claims {
+    let claims = ghapi::Claims {
         iat: (now - 60).try_into().unwrap(),
         exp: (now + 60).try_into().unwrap(),
         iss: config.lock().unwrap().jwt_iss,
@@ -251,7 +92,7 @@ async fn get_token(
         .header("Authorization", format!("Bearer {}", token))
         .send()
         .await?;
-    let access_tokens: AccessTokens = response.json().await?;
+    let access_tokens: ghapi::AccessTokens = response.json().await?;
 
     Ok(access_tokens.token)
 }
@@ -282,7 +123,7 @@ fn check_signature(
     Ok(())
 }
 
-fn parse_event(req: &HttpRequest, bytes: &web::Bytes) -> Result<Event, Error> {
+fn parse_event(req: &HttpRequest, bytes: &web::Bytes) -> Result<ghapi::Event, Error> {
     let event_type = req
         .headers()
         .get("X-GitHub-Event")
@@ -291,7 +132,9 @@ fn parse_event(req: &HttpRequest, bytes: &web::Bytes) -> Result<Event, Error> {
         .map_err(|_| HttpResponse::BadRequest().body("event-type isn't a valid string"))?;
 
     Ok(match event_type {
-        "pull_request" => serde_json::from_slice::<PullRequestEvent>(bytes).map(Event::PullRequest),
+        "pull_request" => {
+            serde_json::from_slice::<ghapi::PullRequestEvent>(bytes).map(ghapi::Event::PullRequest)
+        }
         _ => return Err(HttpResponse::Ok().body("unsupported event").into()),
     }
     .map_err(|_| HttpResponse::Ok().body("can't parse event"))?)
@@ -316,14 +159,14 @@ fn extract_comment_westyml(body: &str) -> Option<(&str, &str)> {
     Some((gitref, manifest))
 }
 
-fn extract_comment_westyml_parsed(body: &str) -> Result<(&str, Vec<WestProject>), anyhow::Error> {
+fn extract_comment_westyml_parsed(body: &str) -> Result<(&str, Vec<west::Project>), anyhow::Error> {
     Ok(extract_comment_westyml(body)
         .map(|(gitref, s)| {
             // yaml doesn't like empty lists
             if s.trim() == "" {
                 Ok((gitref, vec![]))
             } else {
-                serde_yaml::from_str::<Vec<WestProject>>(s).map(|v| (gitref, v))
+                serde_yaml::from_str::<Vec<west::Project>>(s).map(|v| (gitref, v))
             }
         })
         .unwrap_or_else(|| Ok((DEFAULT_BRANCH, vec![])))?)
@@ -336,7 +179,7 @@ fn github_path_from_url(url: &str) -> Option<&str> {
 
 async fn delete_manifest_branch(
     config: &web::Data<Mutex<Config>>,
-    event: &PullRequestEvent,
+    event: &ghapi::PullRequestEvent,
     token: &str,
 ) -> Result<(), Error> {
     let config = config.lock().unwrap();
@@ -370,7 +213,7 @@ async fn delete_manifest_branch(
 
 async fn update_manifest_branch_inner(
     config: &web::Data<Mutex<Config>>,
-    event: &PullRequestEvent,
+    event: &ghapi::PullRequestEvent,
     token: &str,
     force_update: bool,
     log: &mut Vec<u8>,
@@ -523,7 +366,7 @@ async fn update_manifest_branch_inner(
     output.status.check()?;
 
     log.extend_from_slice(b"parse main west.yml...\n");
-    let westyml: WestFile = serde_yaml::from_str(std::str::from_utf8(&output.stdout)?)?;
+    let westyml: west::File = serde_yaml::from_str(std::str::from_utf8(&output.stdout)?)?;
     let westprojects: Vec<_> = westyml
         .manifest
         .projects
@@ -572,17 +415,17 @@ async fn update_manifest_branch_inner(
     let mut westproject = westproject.clone();
     westproject.revision = Some(format!("refs/pull/{}/merge", event.number));
 
-    let mut newwestfile = WestFile {
-        manifest: WestManifest {
+    let mut newwestfile = west::File {
+        manifest: west::Manifest {
             defaults: westyml.manifest.defaults.clone(),
             remotes: westyml.manifest.remotes.clone(),
             projects: vec![
-                WestProject {
+                west::Project {
                     name: "manifest-main".to_string(),
                     repo_path: Some(config.repository.to_string()),
                     revision: Some(comment_manifestref.to_string()),
                     import: Some(true),
-                    ..WestProject::default()
+                    ..west::Project::default()
                 },
                 westproject,
             ],
@@ -685,7 +528,7 @@ async fn update_manifest_branch_inner(
 
 async fn update_manifest_branch(
     config: &web::Data<Mutex<Config>>,
-    event: &PullRequestEvent,
+    event: &ghapi::PullRequestEvent,
     token: &str,
     force_update: bool,
 ) -> Result<(), Error> {
@@ -740,7 +583,7 @@ async fn update_manifest_branch(
 async fn handle_pull_request_event(
     config: &web::Data<Mutex<Config>>,
     jwt_key: &web::Data<Mutex<jsonwebtoken::EncodingKey>>,
-    event: &PullRequestEvent,
+    event: &ghapi::PullRequestEvent,
 ) -> Result<(), Error> {
     let mut found = false;
     for repo_prefix in &config.lock().unwrap().repos_include {
@@ -765,11 +608,13 @@ async fn handle_pull_request_event(
     let token = get_token(config, jwt_key, event.installation.id).await?;
 
     match &event.action {
-        PullRequestAction::Closed => delete_manifest_branch(config, &event, &token).await?,
-        PullRequestAction::Edited | PullRequestAction::Opened | PullRequestAction::Reopened => {
+        ghapi::PullRequestAction::Closed => delete_manifest_branch(config, &event, &token).await?,
+        ghapi::PullRequestAction::Edited
+        | ghapi::PullRequestAction::Opened
+        | ghapi::PullRequestAction::Reopened => {
             update_manifest_branch(config, &event, &token, false).await?;
         }
-        PullRequestAction::Synchronize => {
+        ghapi::PullRequestAction::Synchronize => {
             // make sure a new workflow gets started
             update_manifest_branch(config, &event, &token, true).await?;
         }
@@ -789,7 +634,9 @@ async fn index(
     let event = parse_event(&req, &bytes)?;
 
     match &event {
-        Event::PullRequest(event) => handle_pull_request_event(&config, &jwt_key, event).await?,
+        ghapi::Event::PullRequest(event) => {
+            handle_pull_request_event(&config, &jwt_key, event).await?
+        }
     }
 
     Ok(HttpResponse::Ok().finish())
@@ -871,9 +718,9 @@ mod tests {
             extract_comment_westyml_parsed("west.yml:\n```yaml\n- name: lol\n```\n").unwrap(),
             (
                 DEFAULT_BRANCH,
-                vec![WestProject {
+                vec![west::Project {
                     name: "lol".to_string(),
-                    ..WestProject::default()
+                    ..west::Project::default()
                 }]
             )
         );
@@ -885,9 +732,9 @@ mod tests {
             .unwrap(),
             (
                 "refs/heads/tmp2",
-                vec![WestProject {
+                vec![west::Project {
                     name: "lol".to_string(),
-                    ..WestProject::default()
+                    ..west::Project::default()
                 }]
             )
         );

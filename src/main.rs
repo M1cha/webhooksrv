@@ -16,6 +16,10 @@ static DEFAULT_BRANCH: &str = "refs/heads/main";
 struct Config {
     /// this can be used to verify the signature of GitHub webhook events
     webhook_secret: String,
+    /// secret for accessing the status API
+    api_token: String,
+    /// installation id for the status API, TODO: encode this in the token
+    api_installation_id: u64,
     /// repo with the workflow that gets started on webhook events
     repository: String,
     /// SSL key
@@ -201,8 +205,11 @@ async fn delete_manifest_branch(
     tokio::process::Command::new("git")
         .current_dir(&tmp_repo)
         .arg("push")
-        .arg(build_git_url(&token, &event.repository.full_name))
-        .arg(format!(":refs/heads/manifest/pull/{}", event.number))
+        .arg(build_git_url(&token, &config.repository))
+        .arg(format!(
+            ":refs/heads/manifest/pull/{}/{}",
+            event.repository.full_name, event.number
+        ))
         .spawn()?
         .await?
         .check()
@@ -401,6 +408,8 @@ async fn update_manifest_branch_inner(
     }
 
     let mut file = tokio::fs::File::create(tmp_repo.join("PR_INFO")).await?;
+    file.write_all(format!("PR_REPOSITORY={}\n", event.repository.full_name).as_bytes())
+        .await?;
     file.write_all(format!("PR_NUMBER={}\n", event.number).as_bytes())
         .await?;
     file.write_all(format!("PR_HEAD_SHA={}\n", event.pull_request.head.sha).as_bytes())
@@ -466,8 +475,11 @@ async fn update_manifest_branch_inner(
         .status
         .check()?;
 
-    let url = build_git_url(&token, &event.repository.full_name);
-    let gitref = format!("refs/heads/manifest/pull/{}", event.number);
+    let url = build_git_url(&token, &config.repository);
+    let gitref = format!(
+        "refs/heads/manifest/pull/{}/{}",
+        event.repository.full_name, event.number
+    );
 
     log.extend_from_slice(b"fetch current tmp repo...\n");
     let fetch_result = tokio::process::Command::new("git")
@@ -642,6 +654,83 @@ async fn index(
     Ok(HttpResponse::Ok().finish())
 }
 
+fn check_api_token(config: &web::Data<Mutex<Config>>, req: &HttpRequest) -> Result<(), Error> {
+    let token = req
+        .headers()
+        .get("X-Api-Token")
+        .ok_or_else(|| HttpResponse::BadRequest().body("missing api token"))?;
+    if token != config.lock().unwrap().api_token.as_bytes() {
+        return Err(HttpResponse::Forbidden().body("wrong api token").into());
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct StatusParams {
+    head_sha: String,
+    repository: String,
+    conclusion: String,
+    run_id: String,
+}
+
+async fn status(
+    config: web::Data<Mutex<Config>>,
+    jwt_key: web::Data<Mutex<jsonwebtoken::EncodingKey>>,
+    req: HttpRequest,
+    status_params: web::Json<StatusParams>,
+) -> Result<HttpResponse, Error> {
+    check_api_token(&config, &req)?;
+
+    if !status_params
+        .repository
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '/' || c == '-' || c == '_')
+    {
+        return Ok(HttpResponse::BadRequest().body("unsupported characters in repository"));
+    }
+
+    let installation_id = config.lock().unwrap().api_installation_id;
+    let token = get_github_token(&config, &jwt_key, installation_id).await?;
+
+    let details_url = format!(
+        "https://github.com/{}/actions/runs/{}'",
+        config.lock().unwrap().repository,
+        status_params.run_id
+    );
+    let summary = format!(
+        "[GitHub Actions Run](https://github.com/{}/actions/runs/{})",
+        config.lock().unwrap().repository,
+        status_params.run_id
+    );
+    let request = serde_json::json!({
+        "head_sha": status_params.head_sha,
+        "name": "Manifest Build",
+        "status": "completed",
+        "conclusion": status_params.conclusion,
+        "details_url": details_url,
+        "output": {
+            "title": "Manifest Build",
+            "summary": summary,
+        }
+    });
+    let client = actix_web::client::Client::default();
+
+    let mut response = client
+        .post(format!(
+            "https://api.github.com/repos/{}/check-runs",
+            status_params.repository
+        ))
+        .header("User-Agent", "actix-web")
+        .header("Accept", "application/vnd.github.v3+json")
+        .header("Authorization", format!("token {}", token))
+        .send_json(&request)
+        .await?;
+    let body = response.body().await?;
+
+    Ok(HttpResponse::build(response.status()).body(body))
+}
+
 fn json_error_handler(err: error::JsonPayloadError, _req: &HttpRequest) -> error::Error {
     use actix_web::error::JsonPayloadError;
 
@@ -685,6 +774,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(config.clone())
             .wrap(middleware::Logger::default())
             .service(web::resource("/").route(web::post().to(index)))
+            .service(web::resource("/status").route(web::post().to(status)))
     })
     .bind_openssl("0.0.0.0:443", builder)?
     .run()

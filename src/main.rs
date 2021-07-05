@@ -59,7 +59,7 @@ impl OutputLog for std::process::Output {
     }
 }
 
-async fn get_token(
+async fn get_github_token(
     config: &web::Data<Mutex<Config>>,
     jwt_key: &web::Data<Mutex<jsonwebtoken::EncodingKey>>,
     installation_id: u64,
@@ -605,7 +605,7 @@ async fn handle_pull_request_event(
         }
     }
 
-    let token = get_token(config, jwt_key, event.installation.id).await?;
+    let token = get_github_token(config, jwt_key, event.installation.id).await?;
 
     match &event.action {
         ghapi::PullRequestAction::Closed => delete_manifest_branch(config, &event, &token).await?,

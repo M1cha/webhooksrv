@@ -345,12 +345,11 @@ async fn update_manifest_branch_inner(
         .status
         .check()?;
 
-    log.extend_from_slice(b"create .github directory...\n");
+    log.extend_from_slice(b"checkout manifest code...\n");
     tokio::process::Command::new("git")
         .current_dir(&tmp_repo)
         .arg("checkout")
         .arg("FETCH_HEAD")
-        .arg(".github/workflows/build.yml")
         .stderr(std::process::Stdio::piped())
         .spawn()?
         .wait_with_output()
@@ -359,21 +358,9 @@ async fn update_manifest_branch_inner(
         .status
         .check()?;
 
-    log.extend_from_slice(b"get main west.yml...\n");
-    let output = tokio::process::Command::new("git")
-        .current_dir(&tmp_repo)
-        .arg("show")
-        .arg("FETCH_HEAD:west.yml")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()?
-        .wait_with_output()
-        .await?;
-    output.log(log);
-    output.status.check()?;
-
     log.extend_from_slice(b"parse main west.yml...\n");
-    let westyml: west::File = serde_yaml::from_str(std::str::from_utf8(&output.stdout)?)?;
+    let westyml = std::fs::read_to_string(tmp_repo.join("west.yml"))?;
+    let mut westyml: west::File = serde_yaml::from_str(&westyml)?;
     let westprojects: Vec<_> = westyml
         .manifest
         .projects
@@ -424,25 +411,18 @@ async fn update_manifest_branch_inner(
     let mut westproject = westproject.clone();
     westproject.revision = Some(format!("refs/pull/{}/merge", event.number));
 
-    let mut newwestfile = west::File {
-        manifest: west::Manifest {
-            defaults: westyml.manifest.defaults.clone(),
-            remotes: westyml.manifest.remotes.clone(),
-            projects: vec![
-                west::Project {
-                    name: "manifest-main".to_string(),
-                    repo_path: Some(config.repository.to_string()),
-                    revision: Some(comment_manifestref.to_string()),
-                    import: Some(true),
-                    ..west::Project::default()
-                },
-                westproject,
-            ],
-        },
-    };
-    newwestfile.manifest.projects.append(&mut comment_westyml);
+    if !westyml.manifest.replace_project(westproject) {
+        return Err(anyhow::anyhow!("can't replace PR project"));
+    }
 
-    let newwestfile_str = serde_yaml::to_string(&newwestfile)?;
+    for project in comment_westyml.drain(..) {
+        if !westyml.manifest.replace_project(project) {
+            return Err(anyhow::anyhow!("can't replace comment project"));
+        }
+    }
+    drop(comment_westyml);
+
+    let newwestfile_str = serde_yaml::to_string(&westyml)?;
 
     let mut file = tokio::fs::File::create(tmp_repo.join("west.yml")).await?;
     file.write_all(newwestfile_str.as_bytes()).await?;

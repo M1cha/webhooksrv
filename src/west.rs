@@ -92,4 +92,15 @@ impl Manifest {
     pub fn remote_by_name(&self, name: &str) -> Option<&Remote> {
         self.remotes.iter().find(|&r| r.name == name)
     }
+
+    pub fn replace_project(&mut self, newproject: Project) -> bool {
+        for project in &mut self.projects {
+            if project.name == newproject.name {
+                *project = newproject;
+                return true;
+            }
+        }
+
+        return false;
+    }
 }

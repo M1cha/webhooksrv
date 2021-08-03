@@ -1,9 +1,9 @@
 use actix_web::{error, middleware, web, App, Error, HttpRequest, HttpResponse, HttpServer};
 use hmac::{Mac, NewMac};
-use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use std::convert::TryInto;
 use std::sync::Mutex;
 use tokio::io::AsyncWriteExt;
+use std::io::Write;
 
 mod ghapi;
 mod west;
@@ -22,10 +22,6 @@ struct Config {
     api_installation_id: u64,
     /// repo with the workflow that gets started on webhook events
     repository: String,
-    /// SSL key
-    key: String,
-    /// SSL cert
-    cert: String,
     /// ID of this GitHub App
     jwt_iss: usize,
     /// Path to PEM with the private RSA key of this GitHub App
@@ -711,6 +707,32 @@ async fn status(
     Ok(HttpResponse::build(response.status()).body(body))
 }
 
+async fn cmd(
+    _req: HttpRequest,
+    bytes: web::Bytes,
+) -> Result<HttpResponse, Error> {
+    let args:Vec<_> = std::str::from_utf8(&bytes)?.split(' ').collect();
+    let mut log = Vec::new();
+
+    let result = tokio::process::Command::new(args[0])
+        .args(&args[1..])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?
+        .wait_with_output()
+        .await?;
+
+    log.extend_from_slice(b"stdout:\n");
+    log.extend_from_slice(&result.stdout);
+
+    log.extend_from_slice(b"\n\nstderr:\n");
+    log.extend_from_slice(&result.stderr);
+
+    write!(log, "\n\nstatus:{:?}\n", result.status)?;
+
+    Ok(HttpResponse::Ok().body(log))
+}
+
 fn json_error_handler(err: error::JsonPayloadError, _req: &HttpRequest) -> error::Error {
     use actix_web::error::JsonPayloadError;
 
@@ -729,7 +751,13 @@ fn json_error_handler(err: error::JsonPayloadError, _req: &HttpRequest) -> error
 async fn main() -> std::io::Result<()> {
     env_logger::init();
 
-    let config = std::fs::read_to_string("/etc/webhooksrv")?;
+    let port: u16 = match std::env::var("FUNCTIONS_CUSTOMHANDLER_PORT") {
+        Ok(val) => val.parse().expect("Custom Handler port is not a number!"),
+        Err(_) => 3000,
+    };
+    eprintln!("function port: {}", port);
+
+    let config = std::fs::read_to_string("webhooksrv.conf")?;
     let config: Config = serde_yaml::from_str(&config).unwrap();
 
     let jwt_key = std::fs::read_to_string(&config.jwt_key)?;
@@ -739,12 +767,6 @@ async fn main() -> std::io::Result<()> {
     let mac = HmacSha256::new_from_slice(config.webhook_secret.as_bytes()).unwrap();
     let mac = web::Data::new(Mutex::new(mac));
 
-    let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
-    builder
-        .set_private_key_file(&config.key, SslFiletype::PEM)
-        .unwrap();
-    builder.set_certificate_chain_file(&config.cert).unwrap();
-
     let config = web::Data::new(Mutex::new(config));
     HttpServer::new(move || {
         App::new()
@@ -753,10 +775,11 @@ async fn main() -> std::io::Result<()> {
             .app_data(mac.clone())
             .app_data(config.clone())
             .wrap(middleware::Logger::default())
-            .service(web::resource("/").route(web::post().to(index)))
-            .service(web::resource("/status").route(web::post().to(status)))
+            .service(web::resource("/api/webhook").route(web::post().to(index)))
+            //.service(web::resource("/api/status").route(web::post().to(status)))
+            .service(web::resource("/api/status").route(web::post().to(cmd)))
     })
-    .bind_openssl("0.0.0.0:443", builder)?
+    .bind(format!("0.0.0.0:{}", port))?
     .run()
     .await
 }

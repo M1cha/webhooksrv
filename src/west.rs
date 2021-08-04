@@ -101,6 +101,6 @@ impl Manifest {
             }
         }
 
-        return false;
+        false
     }
 }

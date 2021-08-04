@@ -3,7 +3,6 @@ use hmac::{Mac, NewMac};
 use std::convert::TryInto;
 use std::sync::Mutex;
 use tokio::io::AsyncWriteExt;
-use std::io::Write;
 
 mod ghapi;
 mod west;
@@ -32,31 +31,6 @@ struct Config {
     repos_exclude: Vec<String>,
     /// path where we build the repo contents
     workdir: std::path::PathBuf,
-}
-
-trait ExitStatusCheck {
-    fn check(&self) -> Result<(), anyhow::Error>;
-}
-
-impl ExitStatusCheck for std::process::ExitStatus {
-    fn check(&self) -> Result<(), anyhow::Error> {
-        if !self.success() {
-            return Err(anyhow::anyhow!("process failed: {:?}", self.code()));
-        }
-        Ok(())
-    }
-}
-
-trait OutputLog {
-    fn log(&self, log: &mut Vec<u8>) -> &Self;
-}
-
-impl OutputLog for std::process::Output {
-    fn log(&self, log: &mut Vec<u8>) -> &Self {
-        log.extend_from_slice(&self.stderr);
-
-        self
-    }
 }
 
 async fn get_github_token(
@@ -140,8 +114,14 @@ fn parse_event(req: &HttpRequest, bytes: &web::Bytes) -> Result<ghapi::Event, Er
     .map_err(|_| HttpResponse::Ok().body("can't parse event"))?)
 }
 
+#[cfg(not(test))]
 fn build_git_url(token: &str, repository: &str) -> String {
     format!("https://git:{}@github.com/{}", token, repository)
+}
+
+#[cfg(test)]
+fn build_git_url(_token: &str, repository: &str) -> String {
+    format!("file://{}", repository)
 }
 
 fn extract_comment_westyml(body: &str) -> Option<(&str, &str)> {
@@ -177,6 +157,23 @@ fn github_path_from_url(url: &str) -> Option<&str> {
         .map_or_else(|| url.strip_prefix("ssh://git@github.com/"), |v| Some(v))
 }
 
+fn remote_callbacks_push<'cb>() -> git2::RemoteCallbacks<'cb> {
+    let mut rc = git2::RemoteCallbacks::new();
+    rc.push_update_reference(|name, status| {
+        status.map_or_else(
+            || Ok(()),
+            |status| {
+                Err(git2::Error::from_str(&format!(
+                    "can't update reference `{}`: {}",
+                    name, status
+                )))
+            },
+        )
+    });
+
+    rc
+}
+
 async fn delete_manifest_branch(
     config: &web::Data<Mutex<Config>>,
     event: &ghapi::PullRequestEvent,
@@ -190,26 +187,26 @@ async fn delete_manifest_branch(
     }
     tokio::fs::create_dir_all(&tmp_repo).await?;
 
-    tokio::process::Command::new("git")
-        .current_dir(&tmp_repo)
-        .arg("init")
-        .spawn()?
-        .await?
-        .check()
-        .map_err(|_| HttpResponse::BadRequest().body("can't init tmp git repo"))?;
+    let repo = git2::Repository::init(&tmp_repo)
+        .map_err(|e| HttpResponse::BadRequest().body(format!("can't init tmp git repo: {}", e)))?;
+    let mut remote = repo
+        .remote("origin", &build_git_url(&token, &config.repository))
+        .map_err(|e| HttpResponse::BadRequest().body(format!("can't add remote: {}", e)))?;
 
-    tokio::process::Command::new("git")
-        .current_dir(&tmp_repo)
-        .arg("push")
-        .arg(build_git_url(&token, &config.repository))
-        .arg(format!(
-            ":refs/heads/manifest/pull/{}/{}",
-            event.repository.full_name, event.number
-        ))
-        .spawn()?
-        .await?
-        .check()
-        .map_err(|_| HttpResponse::BadRequest().body("can't delete manifest branch"))?;
+    let mut po = git2::PushOptions::new();
+    po.remote_callbacks(remote_callbacks_push());
+
+    remote
+        .push(
+            &[format!(
+                ":refs/heads/manifest/pull/{}/{}",
+                event.repository.full_name, event.number
+            )],
+            Some(&mut po),
+        )
+        .map_err(|e| {
+            HttpResponse::BadRequest().body(format!("can't delete manifest branch: {}", e))
+        })?;
 
     Ok(())
 }
@@ -222,8 +219,8 @@ async fn update_manifest_branch_inner(
     log: &mut Vec<u8>,
 ) -> Result<(), anyhow::Error> {
     let config = config.lock().unwrap();
-    let manifest_repo = config.workdir.join("manifest");
-    let tmp_repo = config.workdir.join("tmp");
+    let manifest_repo_path = config.workdir.join("manifest");
+    let tmp_repo_path = config.workdir.join("tmp");
 
     log.extend_from_slice(b"extract manifest from PR text...\n");
     let (comment_manifestref, mut comment_westyml) =
@@ -232,130 +229,75 @@ async fn update_manifest_branch_inner(
     log.extend_from_slice(b"create workdir...\n");
     tokio::fs::create_dir_all(&config.workdir).await?;
 
-    if !manifest_repo.exists() {
+    let manifest_repo = if !manifest_repo_path.exists() {
         log.extend_from_slice(b"clone manifest...\n");
-        tokio::process::Command::new("git")
-            .arg("clone")
-            .arg("--bare")
-            .arg(build_git_url(&token, &config.repository))
-            .arg(&manifest_repo)
-            .stderr(std::process::Stdio::piped())
-            .spawn()?
-            .wait_with_output()
-            .await?
-            .log(log)
-            .status
-            .check()?;
+        let mut rb = git2::build::RepoBuilder::new();
+        rb.bare(true).clone(
+            &build_git_url(&token, &config.repository),
+            &manifest_repo_path,
+        )?
     } else {
         log.extend_from_slice(b"set manifest URL...\n");
-        tokio::process::Command::new("git")
-            .current_dir(&manifest_repo)
-            .arg("remote")
-            .arg("set-url")
-            .arg("origin")
-            .arg(build_git_url(&token, &config.repository))
-            .stderr(std::process::Stdio::piped())
-            .spawn()?
-            .wait_with_output()
-            .await?
-            .log(log)
-            .status
-            .check()?;
+        let repo = git2::Repository::open(&manifest_repo_path)?;
+        repo.remote_set_url("origin", &build_git_url(&token, &config.repository))?;
+        repo
+    };
+
+    log.extend_from_slice(b"delete old manifest reference...\n");
+    match manifest_repo.find_reference(&comment_manifestref) {
+        Err(e) if e.code() == git2::ErrorCode::NotFound => (),
+        Err(e) => return Err(e.into()),
+        Ok(mut reference) => reference.delete()?,
     }
 
     log.extend_from_slice(b"update manifest repo...\n");
-    tokio::process::Command::new("git")
-        .current_dir(&manifest_repo)
-        .arg("fetch")
-        .arg("-f")
-        .arg("origin")
-        .arg(format!("{gitref}:{gitref}", gitref = comment_manifestref))
-        .stderr(std::process::Stdio::piped())
-        .spawn()?
-        .wait_with_output()
-        .await?
-        .log(log)
-        .status
-        .check()?;
+    manifest_repo.find_remote("origin")?.fetch(
+        &[format!("{gitref}:{gitref}", gitref = comment_manifestref)],
+        None,
+        None,
+    )?;
 
     log.extend_from_slice(b"create tmp repo dir...\n");
-    if tmp_repo.exists() {
-        tokio::fs::remove_dir_all(&tmp_repo).await?;
+    if tmp_repo_path.exists() {
+        tokio::fs::remove_dir_all(&tmp_repo_path).await?;
     }
-    tokio::fs::create_dir_all(&tmp_repo).await?;
+    tokio::fs::create_dir_all(&tmp_repo_path).await?;
 
     log.extend_from_slice(b"init tmp repo...\n");
-    tokio::process::Command::new("git")
-        .current_dir(&tmp_repo)
-        .arg("init")
-        .stderr(std::process::Stdio::piped())
-        .spawn()?
-        .wait_with_output()
-        .await?
-        .log(log)
-        .status
-        .check()?;
+    let tmp_repo = git2::Repository::init(&tmp_repo_path)?;
+    let mut tmp_repo_config = tmp_repo.config()?;
 
     log.extend_from_slice(b"set git name...\n");
-    tokio::process::Command::new("git")
-        .current_dir(&tmp_repo)
-        .arg("config")
-        .arg("user.name")
-        .arg("multirepo-actions[bot]")
-        .stderr(std::process::Stdio::piped())
-        .spawn()?
-        .wait_with_output()
-        .await?
-        .log(log)
-        .status
-        .check()?;
+    tmp_repo_config.set_str("user.name", "multirepo-actions[bot]")?;
 
     log.extend_from_slice(b"set git email...\n");
-    tokio::process::Command::new("git")
-        .current_dir(&tmp_repo)
-        .arg("config")
-        .arg("user.email")
-        .arg(format!(
+    tmp_repo_config.set_str(
+        "user.email",
+        &format!(
             "{}+multirepo-actions[bot]@users.noreply.github.com",
             config.jwt_iss
-        ))
-        .stderr(std::process::Stdio::piped())
-        .spawn()?
-        .wait_with_output()
-        .await?
-        .log(log)
-        .status
-        .check()?;
+        ),
+    )?;
 
     log.extend_from_slice(b"fetch local manifest repo...\n");
-    tokio::process::Command::new("git")
-        .current_dir(&tmp_repo)
-        .arg("fetch")
-        .arg(&manifest_repo)
-        .arg(comment_manifestref)
-        .stderr(std::process::Stdio::piped())
-        .spawn()?
-        .wait_with_output()
-        .await?
-        .log(log)
-        .status
-        .check()?;
+    tmp_repo
+        .remote_anonymous(
+            manifest_repo_path
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("{:?} is not valid unicode", manifest_repo_path))?,
+        )?
+        .fetch(&[comment_manifestref], None, None)?;
 
     log.extend_from_slice(b"checkout manifest code...\n");
-    tokio::process::Command::new("git")
-        .current_dir(&tmp_repo)
-        .arg("checkout")
-        .arg("FETCH_HEAD")
-        .stderr(std::process::Stdio::piped())
-        .spawn()?
-        .wait_with_output()
-        .await?
-        .log(log)
-        .status
-        .check()?;
+    let fetch_head_oid = tmp_repo
+        .find_reference("FETCH_HEAD")?
+        .target()
+        .ok_or_else(|| anyhow::anyhow!("can't get FETCH_HEAD target"))?;
+    let fetch_head_commit = tmp_repo.find_commit(fetch_head_oid)?;
+    tmp_repo.checkout_tree(fetch_head_commit.as_object(), None)?;
 
     log.extend_from_slice(b"parse main west.yml...\n");
-    let westyml = std::fs::read_to_string(tmp_repo.join("west.yml"))?;
+    let westyml = std::fs::read_to_string(tmp_repo_path.join("west.yml"))?;
     let mut westyml: west::File = serde_yaml::from_str(&westyml)?;
     let westprojects: Vec<_> = westyml
         .manifest
@@ -390,7 +332,7 @@ async fn update_manifest_branch_inner(
         ));
     }
 
-    let mut file = tokio::fs::File::create(tmp_repo.join("PR_INFO")).await?;
+    let mut file = tokio::fs::File::create(tmp_repo_path.join("PR_INFO")).await?;
     file.write_all(format!("PR_REPOSITORY={}\n", event.repository.full_name).as_bytes())
         .await?;
     file.write_all(format!("PR_NUMBER={}\n", event.number).as_bytes())
@@ -420,36 +362,29 @@ async fn update_manifest_branch_inner(
 
     let newwestfile_str = serde_yaml::to_string(&westyml)?;
 
-    let mut file = tokio::fs::File::create(tmp_repo.join("west.yml")).await?;
+    let mut file = tokio::fs::File::create(tmp_repo_path.join("west.yml")).await?;
     file.write_all(newwestfile_str.as_bytes()).await?;
     file.sync_all().await?;
 
     log.extend_from_slice(b"git-add worktree...\n");
-    tokio::process::Command::new("git")
-        .current_dir(&tmp_repo)
-        .arg("add")
-        .arg(".")
-        .stderr(std::process::Stdio::piped())
-        .spawn()?
-        .wait_with_output()
-        .await?
-        .log(log)
-        .status
-        .check()?;
+    let mut index = tmp_repo.index().unwrap();
+    index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)?;
+    let tree_oid = index.write_tree().unwrap();
+    index.write().unwrap();
 
     log.extend_from_slice(b"commit tmp repo...\n");
-    tokio::process::Command::new("git")
-        .current_dir(&tmp_repo)
-        .arg("commit")
-        .arg("-m")
-        .arg(&event.pull_request.title)
-        .stderr(std::process::Stdio::piped())
-        .spawn()?
-        .wait_with_output()
-        .await?
-        .log(log)
-        .status
-        .check()?;
+    let author = tmp_repo.signature()?;
+    let tree = tmp_repo.find_tree(tree_oid).unwrap();
+    tmp_repo
+        .commit(
+            Some("HEAD"),
+            &author,
+            &author,
+            &event.pull_request.title,
+            &tree,
+            &[&fetch_head_commit],
+        )
+        .unwrap();
 
     let url = build_git_url(&token, &config.repository);
     let gitref = format!(
@@ -457,59 +392,40 @@ async fn update_manifest_branch_inner(
         event.repository.full_name, event.number
     );
 
-    log.extend_from_slice(b"fetch current tmp repo...\n");
-    let fetch_result = tokio::process::Command::new("git")
-        .current_dir(&tmp_repo)
-        .arg("fetch")
-        .arg(&url)
-        .arg(&gitref)
-        .stderr(std::process::Stdio::piped())
-        .spawn()?
-        .wait_with_output()
-        .await?
-        .log(log)
-        .status;
+    log.extend_from_slice(b"get list of manifest refs...\n");
+    let mut remote = tmp_repo.remote_anonymous(&url)?;
+    remote.connect(git2::Direction::Fetch)?;
+    let remote_refs = remote.list()?;
 
     if force_update {
         log.extend_from_slice(b"force update.\n");
-    } else if fetch_result.success() {
+    } else if remote_refs.iter().any(|r| r.name() == gitref) {
+        log.extend_from_slice(b"fetch current tmp repo...\n");
+        remote.fetch(&[&gitref], None, None)?;
+
         log.extend_from_slice(b"check if tmp code changed...\n");
-        let diff_result = tokio::process::Command::new("git")
-            .current_dir(&tmp_repo)
-            .arg("diff")
-            .arg("-s")
-            .arg("--exit-code")
-            .arg("FETCH_HEAD")
-            .stderr(std::process::Stdio::piped())
-            .spawn()?
-            .wait_with_output()
-            .await?
-            .log(log)
-            .status;
-        if diff_result.success() {
+        let fetch_head_oid = tmp_repo
+            .find_reference("FETCH_HEAD")?
+            .target()
+            .ok_or_else(|| anyhow::anyhow!("can't get FETCH_HEAD target"))?;
+        let fetch_head_commit = tmp_repo.find_commit(fetch_head_oid)?;
+        let fetch_head_tree = fetch_head_commit.tree()?;
+        let diff = tmp_repo.diff_tree_to_workdir(Some(&fetch_head_tree), None)?;
+
+        if diff.deltas().len() == 0 {
             log.extend_from_slice(b"nothing has changed, don't push.\n");
             return Ok(());
         }
 
         log.extend_from_slice(b"something has changed, let's push.\n");
     } else {
-        log.extend_from_slice(b"can't fetch. ignore and continue pushing.\n");
+        log.extend_from_slice(b"ref doesn't exist yet, let's push.\n");
     }
 
     log.extend_from_slice(b"push tmp repo...\n");
-    tokio::process::Command::new("git")
-        .current_dir(&tmp_repo)
-        .arg("push")
-        .arg("-f")
-        .arg(&url)
-        .arg(format!("HEAD:{}", gitref))
-        .stderr(std::process::Stdio::piped())
-        .spawn()?
-        .wait_with_output()
-        .await?
-        .log(log)
-        .status
-        .check()?;
+    let mut po = git2::PushOptions::new();
+    po.remote_callbacks(remote_callbacks_push());
+    remote.push(&[format!("+HEAD:{}", gitref)], Some(&mut po))?;
 
     Ok(())
 }
@@ -707,6 +623,7 @@ async fn status(
     Ok(HttpResponse::build(response.status()).body(body))
 }
 
+/*
 async fn cmd(
     _req: HttpRequest,
     bytes: web::Bytes,
@@ -715,6 +632,7 @@ async fn cmd(
     let mut log = Vec::new();
 
     let result = tokio::process::Command::new(args[0])
+        .env("LD_DEBUG", "all")
         .args(&args[1..])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -731,7 +649,7 @@ async fn cmd(
     write!(log, "\n\nstatus:{:?}\n", result.status)?;
 
     Ok(HttpResponse::Ok().body(log))
-}
+}*/
 
 fn json_error_handler(err: error::JsonPayloadError, _req: &HttpRequest) -> error::Error {
     use actix_web::error::JsonPayloadError;
@@ -750,6 +668,8 @@ fn json_error_handler(err: error::JsonPayloadError, _req: &HttpRequest) -> error
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init();
+
+    openssl_probe::init_ssl_cert_env_vars();
 
     let port: u16 = match std::env::var("FUNCTIONS_CUSTOMHANDLER_PORT") {
         Ok(val) => val.parse().expect("Custom Handler port is not a number!"),
@@ -776,8 +696,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(config.clone())
             .wrap(middleware::Logger::default())
             .service(web::resource("/api/webhook").route(web::post().to(index)))
-            //.service(web::resource("/api/status").route(web::post().to(status)))
-            .service(web::resource("/api/status").route(web::post().to(cmd)))
+            .service(web::resource("/api/status").route(web::post().to(status)))
     })
     .bind(format!("0.0.0.0:{}", port))?
     .run()
@@ -831,5 +750,125 @@ mod tests {
                 }]
             )
         );
+    }
+
+    async fn make_manifest_repo(repo_path: &std::path::Path, westyml: &west::File) {
+        let workdir = tempfile::tempdir().unwrap();
+
+        // init repo
+        let tmp_repo = git2::Repository::init(&workdir).unwrap();
+
+        // write west.yml
+        let westyml_str = serde_yaml::to_string(&westyml).unwrap();
+        let mut westyml_file = tokio::fs::File::create(workdir.path().join("west.yml"))
+            .await
+            .unwrap();
+        westyml_file
+            .write_all(westyml_str.as_bytes())
+            .await
+            .unwrap();
+        westyml_file.sync_all().await.unwrap();
+
+        // stage files
+        let mut index = tmp_repo.index().unwrap();
+        index.add_path(std::path::Path::new("west.yml")).unwrap();
+        let tree_oid = index.write_tree().unwrap();
+        index.write().unwrap();
+
+        // commit
+        let author = git2::Signature::now("name", "name@example.com").unwrap();
+        let tree = tmp_repo.find_tree(tree_oid).unwrap();
+        tmp_repo
+            .commit(Some("HEAD"), &author, &author, "Initial commit", &tree, &[])
+            .unwrap();
+
+        // init bare repo
+        git2::Repository::init_bare(&repo_path).unwrap();
+
+        // push to remote
+        let repo_url = format!("file://{}", repo_path.to_str().unwrap());
+        let mut remote = tmp_repo.remote_anonymous(&repo_url).unwrap();
+        let mut po = git2::PushOptions::new();
+        po.remote_callbacks(remote_callbacks_push());
+        remote
+            .push(&["HEAD:refs/heads/main"], Some(&mut po))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn update_manifest_branch() {
+        let mut log = vec![];
+        let workdir = tempfile::tempdir().unwrap();
+        let remote_dir = tempfile::tempdir().unwrap();
+
+        eprintln!("workdir: {:?}", workdir);
+        eprintln!("remote_dir: {:?}", remote_dir);
+
+        let westyml = west::File {
+            manifest: west::Manifest {
+                defaults: west::Defaults::default(),
+                remotes: vec![west::Remote {
+                    name: "github".to_string(),
+                    url_base: "https://github.com".to_string(),
+                }],
+                projects: vec![west::Project {
+                    name: "mcuboot".to_string(),
+                    remote: Some("github".to_string()),
+                    repo_path: Some("zephyrproject-rtos/mcuboot".to_string()),
+                    revision: Some("main".to_string()),
+                    ..west::Project::default()
+                }],
+            },
+        };
+
+        let manifest_repo_path = remote_dir.path().join("manifest");
+        make_manifest_repo(&manifest_repo_path, &westyml).await;
+
+        let config = web::Data::new(std::sync::Mutex::new(Config {
+            webhook_secret: "secret".to_string(),
+            api_token: "api-token".to_string(),
+            api_installation_id: 1,
+            repository: manifest_repo_path.to_str().unwrap().to_string(),
+            jwt_iss: 1,
+            jwt_key: "jwt-key".to_string(),
+            repos_include: vec![],
+            repos_exclude: vec![],
+            workdir: workdir.path().to_path_buf(),
+        }));
+
+        let repo = ghapi::Repository {
+            full_name: "zephyrproject-rtos/mcuboot".to_string(),
+        };
+        let event = ghapi::PullRequestEvent {
+            action: ghapi::PullRequestAction::Opened,
+            number: 1,
+            pull_request: ghapi::PullRequest {
+                title: "My PR".to_string(),
+                body: "".to_string(),
+                head: ghapi::Branch {
+                    r#ref: "refs/heads/feature".to_string(),
+                    sha: "00000000".to_string(),
+                    repo: repo.clone(),
+                },
+                base: ghapi::Branch {
+                    r#ref: "refs/heads/main".to_string(),
+                    sha: "00000000".to_string(),
+                    repo: repo.clone(),
+                },
+                state: "open".to_string(),
+            },
+            repository: repo,
+            installation: ghapi::Installation { id: 1 },
+        };
+
+        let result = update_manifest_branch_inner(&config, &event, "token", false, &mut log).await;
+        eprintln!("log:\n{}", String::from_utf8_lossy(&log));
+        result.unwrap();
+
+        let result = update_manifest_branch_inner(&config, &event, "token", false, &mut log).await;
+        eprintln!("log:\n{}", String::from_utf8_lossy(&log));
+        result.unwrap();
+
+        tokio::time::delay_for(tokio::time::Duration::from_secs(9999999)).await;
     }
 }

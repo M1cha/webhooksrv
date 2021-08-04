@@ -26,7 +26,7 @@ pub struct PullRequest {
     pub state: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize)]
 pub struct Repository {
     pub full_name: String,
 }

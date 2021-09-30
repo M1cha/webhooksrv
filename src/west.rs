@@ -18,6 +18,8 @@ pub struct Project {
     pub west_commands: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub import: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub submodules: Option<bool>,
 }
 
 #[derive(Clone, Default, Debug, serde::Deserialize, serde::Serialize)]

@@ -87,12 +87,12 @@ fn check_signature(
             .into());
     }
     let sig = hex::decode(&sig[7..])
-        .map_err(|_| HttpResponse::BadRequest().body("bad signature length"))?;
+        .map_err(|e| HttpResponse::BadRequest().body(format!("bad signature length: {:?}", e)))?;
 
     let mut mac = mac.lock().unwrap().clone();
     mac.update(&bytes);
     mac.verify(&sig)
-        .map_err(|_| HttpResponse::Forbidden().body("invalid signature"))?;
+        .map_err(|e| HttpResponse::Forbidden().body(format!("invalid signature: {:?}", e)))?;
 
     Ok(())
 }
@@ -103,7 +103,9 @@ fn parse_event(req: &HttpRequest, bytes: &web::Bytes) -> Result<ghapi::Event, Er
         .get("X-GitHub-Event")
         .ok_or_else(|| HttpResponse::BadRequest().body("missing event type"))?
         .to_str()
-        .map_err(|_| HttpResponse::BadRequest().body("event-type isn't a valid string"))?;
+        .map_err(|e| {
+            HttpResponse::BadRequest().body(format!("event-type isn't a valid string: {:?}", e))
+        })?;
 
     Ok(match event_type {
         "pull_request" => {
@@ -111,7 +113,7 @@ fn parse_event(req: &HttpRequest, bytes: &web::Bytes) -> Result<ghapi::Event, Er
         }
         _ => return Err(HttpResponse::Ok().body("unsupported event").into()),
     }
-    .map_err(|_| HttpResponse::Ok().body("can't parse event"))?)
+    .map_err(|e| HttpResponse::Ok().body(format!("can't parse event: {:?}", e)))?)
 }
 
 #[cfg(not(test))]

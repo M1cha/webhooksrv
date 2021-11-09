@@ -20,7 +20,7 @@ pub struct Branch {
 #[derive(Debug, serde::Deserialize)]
 pub struct PullRequest {
     pub title: String,
-    pub body: String,
+    pub body: Option<String>,
     pub head: Branch,
     pub base: Branch,
     pub state: String,

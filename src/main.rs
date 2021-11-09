@@ -226,7 +226,7 @@ async fn update_manifest_branch_inner(
 
     log.extend_from_slice(b"extract manifest from PR text...\n");
     let (comment_manifestref, mut comment_westyml) =
-        extract_comment_westyml_parsed(&event.pull_request.body)?;
+        extract_comment_westyml_parsed(event.pull_request.body.as_deref().unwrap_or(""))?;
 
     log.extend_from_slice(b"create workdir...\n");
     tokio::fs::create_dir_all(&config.workdir).await?;

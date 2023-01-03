@@ -128,7 +128,7 @@ fn build_git_url(_token: &str, repository: &str) -> String {
 
 fn extract_comment_westyml(body: &str) -> Option<(&str, &str)> {
     lazy_static::lazy_static! {
-        static ref BODY_REGEX: regex::Regex = regex::Regex::new(r"(?s)west.yml(\(ref:([a-zA-Z0-9/]+)\))?:[\r\n]+```yaml[\r\n]+(.*)[\r\n]+```").unwrap();
+        static ref BODY_REGEX: regex::Regex = regex::Regex::new(r"(?s)west.yml(\(ref:([a-zA-Z0-9/_]+)\))?:[\r\n]+```yaml[\r\n]+(.*)[\r\n]+```").unwrap();
     }
 
     let captures = BODY_REGEX.captures(body)?;
